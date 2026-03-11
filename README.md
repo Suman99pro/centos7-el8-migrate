@@ -114,7 +114,7 @@ CentOS 7.x
 
 ```bash
 # 1. Download the script
-curl -O https://raw.githubusercontent.com/YOUR_ORG/centos7-el8-migrate/main/centos7_to_el8_migrate.sh
+curl -O https://raw.githubusercontent.com/suman99pro/centos7-el8-migrate/main/centos7_to_el8_migrate.sh
 
 # 2. Make it executable
 chmod +x centos7_to_el8_migrate.sh
