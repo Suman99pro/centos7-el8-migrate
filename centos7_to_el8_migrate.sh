@@ -878,6 +878,16 @@ install_elevate() {
         log_ok "elevate-release installed."
     fi
 
+    # Always ensure the elevate repo is enabled (installs disabled by default)
+    log_info "Ensuring ELevate repo is enabled..."
+    if yum-config-manager --enable elevate &>/dev/null 2>&1; then
+        log_ok "ELevate repo enabled via yum-config-manager."
+    else
+        sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
+        log_ok "ELevate repo enabled via repo file."
+    fi
+    yum clean all &>/dev/null
+
     log_info "Installing leapp-upgrade and target OS data..."
 
     case "$TARGET_DISTRO" in
