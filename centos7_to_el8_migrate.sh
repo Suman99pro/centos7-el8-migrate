@@ -868,19 +868,35 @@ install_elevate() {
     log_section "Installing ELevate (leapp-based upgrade tool)"
 
     local elevate_url="https://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm"
-    log_info "Installing ELevate release package..."
-    yum install -y "$elevate_url" 2>&1 | tail -10
+
+    # Install elevate-release only if not already installed
+    if rpm -q elevate-release &>/dev/null 2>&1; then
+        log_ok "elevate-release already installed — skipping."
+    else
+        log_info "Installing ELevate release package..."
+        yum install -y "$elevate_url" 2>&1 | tail -10
+        log_ok "elevate-release installed."
+    fi
 
     log_info "Installing leapp-upgrade and target OS data..."
 
     case "$TARGET_DISTRO" in
         alma)
-            yum install -y leapp-upgrade leapp-data-almalinux 2>&1 | tail -20
+            yum install -y leapp-upgrade leapp-data-almalinux 2>&1 | tail -20 || true
+            # Verify the packages actually landed
+            if ! rpm -q leapp-upgrade &>/dev/null 2>&1; then
+                die "leapp-upgrade failed to install. Check yum output above."
+            fi
+            if ! rpm -q leapp-data-almalinux &>/dev/null 2>&1; then
+                die "leapp-data-almalinux failed to install. Check yum output above."
+            fi
             ;;
         rocky)
-            # For Rocky Linux, use the Rocky-specific leapp data
             yum install -y leapp-upgrade leapp-data-rocky 2>&1 | tail -20 || \
-            yum install -y leapp-upgrade python2-leapp 2>&1 | tail -20
+            yum install -y leapp-upgrade python2-leapp 2>&1 | tail -20 || true
+            if ! rpm -q leapp-upgrade &>/dev/null 2>&1; then
+                die "leapp-upgrade failed to install. Check yum output above."
+            fi
             ;;
         *)
             die "Unknown target distro: $TARGET_DISTRO"
