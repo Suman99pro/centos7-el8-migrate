@@ -479,8 +479,12 @@ analyze_installed_packages() {
     echo
 
     # Check for custom kernel modules
-    if find /lib/modules/"$(uname -r)"/extra/ -name "*.ko" &>/dev/null 2>&1; then
-        log_high "Custom kernel modules detected in /lib/modules/$(uname -r)/extra/ — these will NOT work with EL8 kernel."
+    local extra_dir="/lib/modules/$(uname -r)/extra"
+    if [[ -d "$extra_dir" ]] && find "$extra_dir" -name "*.ko" 2>/dev/null | grep -q "."; then
+        log_high "Custom kernel modules detected in $extra_dir — these will NOT work with EL8 kernel."
+        find "$extra_dir" -name "*.ko" 2>/dev/null
+    else
+        log_ok "No custom kernel modules found in extra/."
     fi
 }
 
@@ -586,15 +590,28 @@ analyze_applications_deep() {
     echo "--- All Installed Packages (grouped by origin) ---"
     # Packages NOT from CentOS/RHEL repos
     echo "  Third-party / Unknown origin packages:"
-    rpm -qa --queryformat '%{NAME} %{VENDOR}\n' 2>/dev/null | \
-        grep -v -iE "centos|red hat|fedora" | sort | head -50
+    local third_party
+    third_party=$(rpm -qa --queryformat '%{NAME} %{VENDOR}\n' 2>/dev/null | \
+        grep -v -iE "centos|red hat|fedora" | sort | head -50 || true)
+    if [[ -n "$third_party" ]]; then
+        echo "$third_party"
+    else
+        echo "  (none detected — all packages from CentOS/Red Hat)"
+    fi
     echo
 
     # RPM scriptlets that may fail
     echo "--- Packages with Post-install Scriptlets ---"
-    rpm -qa --queryformat '%{NAME}\n' 2>/dev/null | \
+    local scriptlets
+    scriptlets=$(rpm -qa --queryformat '%{NAME}\n' 2>/dev/null | \
         xargs -I{} rpm -q --scripts {} 2>/dev/null | \
-        grep -B1 "postinstall\|preinstall" | grep -v "^--$" | head -30
+        grep -B1 "postinstall\|preinstall" 2>/dev/null | \
+        grep -v "^--$" 2>/dev/null | head -30 || true)
+    if [[ -n "$scriptlets" ]]; then
+        echo "$scriptlets"
+    else
+        echo "  (none found)"
+    fi
     echo
 
     # Shared libraries
