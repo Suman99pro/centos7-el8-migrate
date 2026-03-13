@@ -1,1789 +1,1361 @@
 #!/usr/bin/env bash
 # =============================================================================
-# CentOS 7.x → AlmaLinux 8 / Rocky Linux 8 Migration Script
+#  CentOS 7 → AlmaLinux 8 / Rocky Linux 8  ·  Migration Toolkit  v3.0.0
 # =============================================================================
-# Version   : 2.0.0
-# Author    : Production Migration Toolkit
-# Requires  : CentOS 7.x, root privileges
-# Tested on : CentOS 7.6 / 7.7 / 7.8 / 7.9
+#  Modular, menu-driven, non-destructive assessment → fix → migrate workflow.
 #
-# FEATURES:
-#   - Pre-flight system analysis (OS, apps, services, deps)
-#   - Full disk image backup to a block device (dd + verification)
-#   - Compatibility & breakage risk assessment
-#   - ELevate (leapp) based in-place upgrade
-#   - Post-upgrade validation
-#   - Future upgrade path analysis (EL8 → EL9)
-#   - Full audit log
+#  USAGE:
+#    sudo ./centos7_to_el8_migrate.sh [OPTIONS]
 #
-# USAGE:
-#   chmod +x centos7_to_el8_migrate.sh
-#   sudo ./centos7_to_el8_migrate.sh [OPTIONS]
-#
-# OPTIONS:
-#   --target   alma|rocky          Target distro  (default: interactive)
-#   --backup-dev /dev/sdX          Block device for backup (REQUIRED for backup)
-#   --skip-backup                  Skip disk image backup (DANGEROUS)
-#   --analyze-only                 Run analysis only, no upgrade
-#   --auto-yes                     Non-interactive (accept all prompts) USE WITH CAUTION
-#   --log-dir /path                Log directory  (default: /var/log/el8-migration)
-#
-# DISCLAIMER:
-#   Test on a non-production clone first. The authors accept no liability
-#   for data loss. Always have a verified backup before proceeding.
+#  OPTIONS:
+#    --assess          Run preflight assessment only (no changes)
+#    --fix             Auto-fix safe issues found during assessment
+#    --migrate         Full interactive migration
+#    --post-upgrade    Post-reboot validation
+#    --target alma|rocky   Pre-select target distro
+#    --backup-dev /dev/sdX Block device for disk backup
+#    --skip-backup     Skip backup phase (DANGEROUS)
+#    --auto-yes        Non-interactive mode (CI/testing only)
+#    --log-dir /path   Custom log dir (default: /var/log/el8-migration)
+#    --help            Show this help
 # =============================================================================
 
-set -euo pipefail
+# ---------------------------------------------------------------------------
+# SHELL OPTIONS — deliberately NO set -e; errors are handled explicitly
+# ---------------------------------------------------------------------------
+set -uo pipefail
 IFS=$'\n\t'
 
 # ---------------------------------------------------------------------------
-# GLOBAL CONSTANTS & DEFAULTS
+# VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="3.0.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
-# Resolved at runtime after leapp is installed
-LEAPP_BIN=""
-
+# ---------------------------------------------------------------------------
+# DEFAULTS
+# ---------------------------------------------------------------------------
 LOG_DIR="/var/log/el8-migration"
 LOG_FILE=""
 REPORT_FILE=""
-TARGET_DISTRO=""          # alma | rocky
-BACKUP_DEV=""             # e.g. /dev/sdb
+TARGET_DISTRO=""
+BACKUP_DEV=""
 SKIP_BACKUP=false
-ANALYZE_ONLY=false
 AUTO_YES=false
+MODE=""
 
-# Colours
+# ---------------------------------------------------------------------------
+# RUNTIME STATE
+# ---------------------------------------------------------------------------
+LEAPP_BIN=""
+STATE_FILE=""
+
+# Preflight finding arrays
+PREFLIGHT_BLOCKS=()
+PREFLIGHT_WARNS=()
+PREFLIGHT_AUTOS=()
+PREFLIGHT_INFO=()
+PREFLIGHT_PASS=()
+
+# ---------------------------------------------------------------------------
+# COLOURS
+# ---------------------------------------------------------------------------
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
+BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; WHITE='\033[1;37m'
 
-# Risk counters (populated during analysis)
-RISK_CRITICAL=0
-RISK_HIGH=0
-RISK_MEDIUM=0
-RISK_LOW=0
+# ===========================================================================
+#  LOGGING & HELPERS
+# ===========================================================================
 
-# ---------------------------------------------------------------------------
-# LOGGING & OUTPUT HELPERS
-# ---------------------------------------------------------------------------
 init_logging() {
     mkdir -p "$LOG_DIR"
     LOG_FILE="${LOG_DIR}/migration_${START_TIME}.log"
-    REPORT_FILE="${LOG_DIR}/migration_report_${START_TIME}.txt"
-    touch "$LOG_FILE" "$REPORT_FILE"
-    # Tee all output to log
+    REPORT_FILE="${LOG_DIR}/preflight_report_${START_TIME}.txt"
+    STATE_FILE="${LOG_DIR}/.migration_state"
+    touch "$LOG_FILE"
     exec > >(tee -a "$LOG_FILE") 2>&1
-    log_info "Logging initialised → $LOG_FILE"
+    log_info "Log: $LOG_FILE"
 }
 
-log()         { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-log_info()    { log "${GREEN}[INFO]${RESET}  $*"; }
-log_warn()    { log "${YELLOW}[WARN]${RESET}  $*"; ((RISK_MEDIUM++)) || true; }
-log_error()   { log "${RED}[ERROR]${RESET} $*"; }
-log_high()    { log "${RED}[HIGH-RISK]${RESET} $*"; ((RISK_HIGH++)) || true; }
-log_critical(){ log "${RED}${BOLD}[CRITICAL]${RESET} $*"; ((RISK_CRITICAL++)) || true; }
-log_low()     { log "${BLUE}[LOW-RISK]${RESET} $*"; ((RISK_LOW++)) || true; }
-log_ok()      { log "${GREEN}[OK]${RESET}    $*"; }
-log_section() { echo -e "\n${BOLD}${CYAN}════════════════════════════════════════════════════${RESET}"; \
-                echo -e "${BOLD}${CYAN}  $*${RESET}"; \
-                echo -e "${BOLD}${CYAN}════════════════════════════════════════════════════${RESET}"; }
+_ts()      { date '+%Y-%m-%d %H:%M:%S'; }
+log()      { echo -e "[$(_ts)] $*"; }
+log_info() { log "${GREEN}[INFO]${RESET}   $*"; }
+log_ok()   { log "${GREEN}[OK]${RESET}     $*"; }
+log_warn() { log "${YELLOW}[WARN]${RESET}   $*"; }
+log_error(){ log "${RED}[ERROR]${RESET}  $*"; }
+log_section() {
+    echo
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  $*${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${RESET}"
+}
+
+# Preflight collectors — never exit, just record
+pf_block() { PREFLIGHT_BLOCKS+=("$*"); log "${RED}${BOLD}[BLOCK]${RESET}    $*"; }
+pf_warn()  { PREFLIGHT_WARNS+=("$*");  log "${YELLOW}[WARN]${RESET}     $*"; }
+pf_auto()  { PREFLIGHT_AUTOS+=("$*");  log "${MAGENTA}[AUTO-FIX]${RESET} $*"; }
+pf_info()  { PREFLIGHT_INFO+=("$*");   log "${BLUE}[INFO]${RESET}     $*"; }
+pf_pass()  { PREFLIGHT_PASS+=("$*");   log "${GREEN}[PASS]${RESET}     $*"; }
+
+# Hard exit — only for situations truly unrecoverable (no root, etc.)
+die() { log_error "FATAL: $*"; exit 1; }
+
+confirm() {
+    local msg="$1"
+    [[ "$AUTO_YES" == true ]] && { log_info "Auto-yes: $msg"; return 0; }
+    echo -en "\n${YELLOW}  ▶ ${msg} [y/N]: ${RESET}"
+    local ans; read -r ans
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# State persistence
+state_set() { grep -v "^${1}=" "$STATE_FILE" 2>/dev/null > "${STATE_FILE}.tmp" || true; mv "${STATE_FILE}.tmp" "$STATE_FILE" 2>/dev/null || true; echo "${1}=${2}" >> "$STATE_FILE"; }
+state_get() { grep "^${1}=" "$STATE_FILE" 2>/dev/null | cut -d= -f2- || echo ""; }
+state_init(){ mkdir -p "$LOG_DIR"; touch "${LOG_DIR}/.migration_state"; STATE_FILE="${LOG_DIR}/.migration_state"; }
 
 banner() {
+    clear 2>/dev/null || true
     echo -e "${BOLD}${CYAN}"
-    cat <<'EOF'
+    cat <<'BANNER'
   ██████╗███████╗███╗   ██╗████████╗ ██████╗ ███████╗    ███████╗██╗
  ██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔═══██╗██╔════╝    ██╔════╝██║
  ██║     █████╗  ██╔██╗ ██║   ██║   ██║   ██║███████╗    █████╗  ██║
  ██║     ██╔══╝  ██║╚██╗██║   ██║   ██║   ██║╚════██║    ██╔══╝  ██║
  ╚██████╗███████╗██║ ╚████║   ██║   ╚██████╔╝███████║    ███████╗███████╗
   ╚═════╝╚══════╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚══════╝    ╚══════╝╚══════╝
-           CentOS 7 → AlmaLinux 8 / Rocky Linux 8 Migration Toolkit
-EOF
+       CentOS 7  →  AlmaLinux 8 / Rocky Linux 8  Migration Toolkit
+BANNER
     echo -e "${RESET}"
-    echo -e "  Version : ${SCRIPT_VERSION}   |   $(date)   |   Host: $(hostname -f)"
+    echo -e "  ${WHITE}Version:${RESET} ${SCRIPT_VERSION}   ${WHITE}Date:${RESET} $(date '+%Y-%m-%d %H:%M')   ${WHITE}Host:${RESET} $(hostname -f 2>/dev/null || hostname)"
     echo
-}
-
-confirm() {
-    local msg="$1"
-    if [[ "$AUTO_YES" == true ]]; then
-        log_info "Auto-yes: $msg"
-        return 0
-    fi
-    echo -en "${YELLOW}${msg} [y/N] ${RESET}"
-    read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]]
-}
-
-die() { log_error "$*"; exit 1; }
-
-# ---------------------------------------------------------------------------
-# ARGUMENT PARSING
-# ---------------------------------------------------------------------------
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --target)        TARGET_DISTRO="${2,,}"; shift 2 ;;
-            --backup-dev)    BACKUP_DEV="$2"; shift 2 ;;
-            --skip-backup)   SKIP_BACKUP=true; shift ;;
-            --analyze-only)  ANALYZE_ONLY=true; shift ;;
-            --auto-yes)      AUTO_YES=true; shift ;;
-            --log-dir)       LOG_DIR="$2"; shift 2 ;;
-            -h|--help)       usage; exit 0 ;;
-            *) die "Unknown option: $1. Use --help." ;;
-        esac
-    done
 }
 
 usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME [OPTIONS]
+Usage: sudo $SCRIPT_NAME [OPTIONS]
 
-  --target   alma|rocky          Target distribution
-  --backup-dev /dev/sdX          Block device for disk image backup
-  --skip-backup                  Skip backup step (NOT recommended)
-  --analyze-only                 Analysis + report only, no changes
-  --auto-yes                     Non-interactive mode
-  --log-dir /path                Custom log directory (default: /var/log/el8-migration)
-  -h, --help                     Show this help
+Modes (or run with no flags for interactive menu):
+  --assess            Preflight assessment — zero changes made
+  --fix               Auto-fix safe issues found by assess
+  --migrate           Full interactive migration wizard
+  --post-upgrade      Post-reboot validation
+
+Options:
+  --target alma|rocky   Pre-select target distribution
+  --backup-dev /dev/sdX Block device for full disk image backup
+  --skip-backup         Skip backup (NOT recommended in production)
+  --auto-yes            Non-interactive mode
+  --log-dir /path       Log directory (default: /var/log/el8-migration)
+  -h, --help            Show this help
 
 Examples:
-  # Full migration to AlmaLinux 8 with backup to /dev/sdb
-  sudo $SCRIPT_NAME --target alma --backup-dev /dev/sdb
-
-  # Analysis only — no changes
-  sudo $SCRIPT_NAME --analyze-only
-
-  # Rocky Linux, skip backup (if already backed up externally)
-  sudo $SCRIPT_NAME --target rocky --skip-backup
+  sudo $SCRIPT_NAME --assess
+  sudo $SCRIPT_NAME --fix
+  sudo $SCRIPT_NAME --migrate --target alma --backup-dev /dev/sdb
+  sudo $SCRIPT_NAME --post-upgrade
 EOF
 }
 
-# ---------------------------------------------------------------------------
-# PREFLIGHT: ENVIRONMENT CHECKS
-# ---------------------------------------------------------------------------
-check_root() {
-    [[ $EUID -eq 0 ]] || die "This script must be run as root (use sudo)."
-    log_ok "Running as root."
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --assess)       MODE="assess"; shift ;;
+            --fix)          MODE="fix"; shift ;;
+            --migrate)      MODE="migrate"; shift ;;
+            --post-upgrade) MODE="post-upgrade"; shift ;;
+            --target)       TARGET_DISTRO="${2,,}"; shift 2 ;;
+            --backup-dev)   BACKUP_DEV="$2"; shift 2 ;;
+            --skip-backup)  SKIP_BACKUP=true; shift ;;
+            --auto-yes)     AUTO_YES=true; shift ;;
+            --log-dir)      LOG_DIR="$2"; shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            *) echo "Unknown option: $1  (use --help)"; exit 1 ;;
+        esac
+    done
 }
 
-check_centos7() {
+# ===========================================================================
+#  SECTION 1 — PREFLIGHT ASSESSMENT  (read-only, never exits on error)
+# ===========================================================================
+
+preflight_reset() {
+    PREFLIGHT_BLOCKS=(); PREFLIGHT_WARNS=()
+    PREFLIGHT_AUTOS=();  PREFLIGHT_INFO=(); PREFLIGHT_PASS=()
+}
+
+# --- individual checks -------------------------------------------------------
+
+_pf_root() {
+    if [[ $EUID -ne 0 ]]; then
+        pf_block "Must run as root. Re-run with: sudo $SCRIPT_NAME"
+    else
+        pf_pass "Running as root."
+    fi
+}
+
+_pf_os() {
     if [[ ! -f /etc/centos-release ]]; then
-        die "This script only supports CentOS 7. /etc/centos-release not found."
+        pf_block "Not a CentOS system (/etc/centos-release missing)."
+        return
     fi
     local ver
     ver=$(rpm -q --queryformat '%{VERSION}' centos-release 2>/dev/null || echo "")
     if [[ "$ver" != "7" ]]; then
-        die "Detected CentOS version '$ver'. Only CentOS 7.x is supported."
+        pf_block "CentOS version '$ver' detected. Only CentOS 7.x is supported."
+    else
+        pf_pass "OS: $(cat /etc/centos-release)"
     fi
-    log_ok "CentOS 7 confirmed: $(cat /etc/centos-release)"
 }
 
-check_required_tools() {
-    log_section "Checking Required Tools"
-    local tools=(rpm yum lsblk df free uname ss lsof ip awk grep sed curl)
+_pf_disk() {
+    local root_avail boot_avail var_avail
+    root_avail=$(df --output=avail -BG / 2>/dev/null | tail -1 | tr -d 'G ' || echo "0")
+    boot_avail=$(df --output=avail -BG /boot 2>/dev/null | tail -1 | tr -d 'G ' || echo "0")
+    var_avail=$(df --output=avail -BG /var 2>/dev/null | tail -1 | tr -d 'G ' || echo "0")
+
+    if [[ "$root_avail" -lt 10 ]]; then
+        pf_block "/ has only ${root_avail}G free. ELevate requires ≥10G. Run: yum clean all; package-cleanup --oldkernels"
+    else
+        pf_pass "/ disk: ${root_avail}G free (≥10G required)."
+    fi
+
+    if [[ "$boot_avail" -lt 1 ]]; then
+        pf_block "/boot has only ${boot_avail}G free. Need ≥1G. Run: package-cleanup --oldkernels --count=1"
+    else
+        pf_pass "/boot disk: ${boot_avail}G free."
+    fi
+
+    if [[ "$var_avail" -lt 3 ]]; then
+        pf_warn "/var has only ${var_avail}G free. leapp scratch needs ≥3G in /var. Free space before migrating."
+    else
+        pf_pass "/var disk: ${var_avail}G free."
+    fi
+}
+
+_pf_network() {
+    if curl -4 --silent --max-time 10 --head "https://repo.almalinux.org" &>/dev/null; then
+        pf_pass "Network: repo.almalinux.org reachable (IPv4)."
+    else
+        pf_block "Cannot reach repo.almalinux.org via IPv4. Internet required for ELevate packages and repo sync."
+    fi
+
+    local ipv6_disabled
+    ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "1")
+    if [[ "$ipv6_disabled" == "0" ]]; then
+        if ! ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
+            pf_auto "IPv6 enabled but not working. Will be disabled — broken IPv6 causes leapp nspawn repo failures."
+        else
+            pf_pass "IPv6: working."
+        fi
+    else
+        pf_pass "IPv6: already disabled (safe for leapp)."
+    fi
+}
+
+_pf_tools() {
     local missing=()
-    for t in "${tools[@]}"; do
+    for t in rpm yum curl lsblk df free uname ss ip awk grep sed; do
         command -v "$t" &>/dev/null || missing+=("$t")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
-        log_warn "Missing tools: ${missing[*]}. Attempting to install..."
-        yum install -y "${missing[@]}" 2>/dev/null || log_warn "Could not install all missing tools."
+        pf_auto "Missing tools: ${missing[*]}. Will install automatically."
     else
-        log_ok "All required tools are present."
+        pf_pass "All required CLI tools present."
     fi
 }
 
-# ---------------------------------------------------------------------------
-# SECTION 1: SYSTEM ANALYSIS
-# ---------------------------------------------------------------------------
-analyze_system() {
-    log_section "1. System Information"
-
-    echo "--- Kernel & OS ---"
-    uname -a
-    cat /etc/centos-release
-    echo
-
-    echo "--- CPU ---"
-    lscpu | grep -E "Architecture|CPU\(s\)|Model name|Socket|Thread"
-    echo
-
-    echo "--- Memory ---"
-    free -h
-    echo
-
-    echo "--- Disk Usage ---"
-    df -hT
-    echo
-
-    echo "--- Block Devices ---"
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,UUID
-    echo
-
-    echo "--- Uptime ---"
-    uptime
-    echo
-
-    # Check if running in a VM or cloud
-    local virt
-    virt=$(systemd-detect-virt 2>/dev/null || echo "unknown")
-    log_info "Virtualisation: $virt"
-
-    # SELinux
-    local selinux_status
-    selinux_status=$(getenforce 2>/dev/null || echo "disabled")
-    log_info "SELinux: $selinux_status"
-    if [[ "$selinux_status" == "Enforcing" ]]; then
-        log_warn "SELinux is Enforcing — policy changes during upgrade may affect services."
-    fi
-
-    # Firewall
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-        log_info "Firewalld is active."
-        firewall-cmd --list-all 2>/dev/null || true
-    elif systemctl is-active --quiet iptables 2>/dev/null; then
-        log_warn "iptables is active (not firewalld). Rules must be migrated manually."
-    fi
-}
-
-analyze_boot() {
-    log_section "2. Boot & Storage Configuration"
-
-    echo "--- Bootloader ---"
+_pf_boot() {
     if [[ -d /sys/firmware/efi ]]; then
-        log_info "UEFI boot detected."
-        efibootmgr 2>/dev/null | head -20 || true
+        pf_info "Boot: UEFI. leapp handles EFI grub2 update automatically."
     else
-        log_info "BIOS/Legacy boot detected."
-        grub2-editenv list 2>/dev/null || true
+        pf_info "Boot: BIOS/Legacy. leapp runs grub2-install automatically."
     fi
 
-    echo
-    echo "--- /etc/fstab ---"
-    cat /etc/fstab
-    echo
-
-    # Check for LVM
-    if command -v pvs &>/dev/null && pvs &>/dev/null 2>&1; then
-        echo "--- LVM Physical Volumes ---"
-        pvs
-        echo "--- LVM Volume Groups ---"
-        vgs
-        echo "--- LVM Logical Volumes ---"
-        lvs
-    fi
-
-    # Check for software RAID
-    if [[ -f /proc/mdstat ]]; then
-        echo "--- Software RAID (mdstat) ---"
-        cat /proc/mdstat
-        if grep -q "active" /proc/mdstat; then
-            log_info "Software RAID detected — ensure all arrays are healthy before upgrade."
+    if grep -q "active" /proc/mdstat 2>/dev/null; then
+        if grep -q "_" /proc/mdstat 2>/dev/null; then
+            pf_block "Software RAID appears degraded (/proc/mdstat contains '_'). Repair before upgrading."
+        else
+            pf_warn "Software RAID detected. Verify all arrays healthy: cat /proc/mdstat"
         fi
     fi
 
-    # Check for network filesystems
-    if grep -qE "nfs|cifs|glusterfs|cephfs" /etc/fstab 2>/dev/null; then
-        log_warn "Network filesystems found in /etc/fstab — these may not automount during upgrade reboot."
+    local kcount
+    kcount=$(rpm -q kernel 2>/dev/null | wc -l || echo "0")
+    if [[ "$kcount" -gt 2 ]]; then
+        pf_auto "$kcount kernel packages installed. Old kernels will be removed to free /boot space."
+    else
+        pf_pass "Kernel count: $kcount."
     fi
 }
 
-analyze_network() {
-    log_section "3. Network Configuration"
-
-    echo "--- IP Addresses ---"
-    ip addr show
-    echo
-
-    echo "--- Routing Table ---"
-    ip route
-    echo
-
-    echo "--- DNS ---"
-    cat /etc/resolv.conf
-    echo
-
-    echo "--- Hostname ---"
-    hostnamectl
-    echo
-
-    echo "--- Network Interfaces (nmcli) ---"
-    nmcli device status 2>/dev/null || ip link show
-    echo
-
-    echo "--- Listening Services ---"
-    ss -tlnpu
-    echo
-
-    # Check for bonding/teaming
-    if ls /proc/net/bonding/ &>/dev/null 2>&1; then
-        log_warn "Network bonding detected — verify bond config persists post-upgrade."
-        ls /proc/net/bonding/
-    fi
-}
-
-analyze_repositories() {
-    log_section "4. YUM Repositories"
-
-    echo "--- Enabled Repos ---"
-    yum repolist enabled 2>/dev/null
-    echo
-
-    echo "--- All Repos (including disabled) ---"
-    yum repolist all 2>/dev/null | head -60
-    echo
-
-    # Check for third-party repos
-    local third_party_repos=()
-    while IFS= read -r repo_file; do
-        local name
-        name=$(basename "$repo_file" .repo)
-        if ! echo "$name" | grep -qiE "^(CentOS|base|updates|extras|epel|centos)"; then
-            third_party_repos+=("$name")
-        fi
-    done < <(find /etc/yum.repos.d/ -name "*.repo" 2>/dev/null)
-
-    if [[ ${#third_party_repos[@]} -gt 0 ]]; then
-        log_warn "Third-party repositories detected: ${third_party_repos[*]}"
-        log_warn "These repos will NOT automatically migrate. Review compatibility with EL8."
-    fi
-
-    # Specific high-risk repo checks
-    for repo in percona mariadb mysql nginx elastic remi ius webtatic; do
-        if find /etc/yum.repos.d/ -name "*.repo" -exec grep -li "$repo" {} \; | grep -q .; then
-            log_high "Repo '$repo' detected — verify EL8-compatible version exists before upgrade."
-        fi
-    done
-}
-
-analyze_installed_packages() {
-    log_section "5. Installed Packages & Known Incompatibilities"
-
+_pf_packages() {
     local pkg_count
-    pkg_count=$(rpm -qa | wc -l)
-    log_info "Total installed packages: $pkg_count"
+    pkg_count=$(rpm -qa 2>/dev/null | wc -l || echo "0")
+    pf_info "Total installed packages: $pkg_count."
 
-    echo
-    echo "--- Packages with KNOWN EL7→EL8 Breakage Risk ---"
+    # ABRT
+    local abrt
+    abrt=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
+    if [[ -n "$abrt" ]]; then
+        pf_auto "ABRT packages detected. These conflict with leapp and will be removed safely."
+    else
+        pf_pass "No ABRT packages."
+    fi
+
+    # SCL
+    if rpm -q centos-release-scl &>/dev/null 2>&1 || rpm -q scl-utils &>/dev/null 2>&1; then
+        pf_warn "Software Collections (SCL) detected. SCL is NOT available in EL8. Migrate SCL apps to AppStream module streams."
+    fi
 
     # PHP
-    local php_ver
-    php_ver=$(php -v 2>/dev/null | head -1 || echo "")
-    if [[ -n "$php_ver" ]]; then
-        log_warn "PHP detected: $php_ver"
-        if echo "$php_ver" | grep -qE "PHP 5\.|PHP 7\.[01]"; then
-            log_high "PHP version is EOL and NOT available in EL8 AppStream. Must upgrade to PHP 7.4+ or 8.x first or use SCL."
+    local php
+    php=$(php -v 2>/dev/null | head -1 | grep -oE "PHP [0-9]+\.[0-9]+" || echo "")
+    if [[ -n "$php" ]]; then
+        if echo "$php" | grep -qE "PHP (5\.|7\.[01])"; then
+            pf_warn "EOL PHP detected: $php. Not in EL8 default repos. Plan migration to PHP 7.4+ or 8.x."
         else
-            log_info "PHP version appears compatible. Verify SCL/Remi repo for EL8."
+            pf_info "PHP detected: $php. Verify EL8 AppStream/Remi availability."
         fi
     fi
 
-    # Python
-    echo
-    echo "--- Python ---"
-    python --version 2>/dev/null || true
-    python2 --version 2>/dev/null || true
-    python3 --version 2>/dev/null || true
-    log_warn "Python 2 is removed in EL8. Any Python 2 scripts/apps need porting or containerising."
-
-    # MySQL / MariaDB
+    # MySQL
     if rpm -q mysql-server &>/dev/null 2>&1; then
-        log_high "MySQL Server detected. MySQL 5.x is NOT in EL8 repos. Migrate to MySQL 8.0 or MariaDB 10.x."
+        pf_warn "MySQL Server detected. MySQL 5.x not in EL8 repos. Plan migration to MySQL 8.0 or MariaDB 10.x."
     fi
+
+    # MariaDB
     if rpm -q mariadb-server &>/dev/null 2>&1; then
-        local mdb_ver
-        mdb_ver=$(mysql --version 2>/dev/null | awk '{print $5}' | tr -d ',')
-        log_warn "MariaDB detected ($mdb_ver). EL8 ships MariaDB 10.3. Verify data compatibility."
+        pf_info "MariaDB detected. EL8 ships MariaDB 10.3+. Verify data compatibility."
     fi
 
     # PostgreSQL
     if rpm -q postgresql-server &>/dev/null 2>&1; then
-        log_warn "PostgreSQL detected. Verify target version is available in EL8 PostgreSQL repo."
+        pf_info "PostgreSQL detected. Use PostgreSQL official EL8 repo post-upgrade."
     fi
-
-    # Apache / HTTPD
-    if rpm -q httpd &>/dev/null 2>&1; then
-        local ap_ver
-        ap_ver=$(httpd -v 2>/dev/null | head -1 || echo "unknown")
-        log_info "Apache HTTPD detected: $ap_ver — EL8 ships httpd 2.4 (compatible)."
-        # Check for mod_php vs php-fpm
-        if rpm -q mod_php &>/dev/null 2>&1 || rpm -q php &>/dev/null 2>&1; then
-            log_warn "mod_php (prefork MPM) detected. EL8 prefers php-fpm with event MPM — reconfiguration required."
-        fi
-    fi
-
-    # Nginx
-    if rpm -q nginx &>/dev/null 2>&1; then
-        log_info "Nginx detected: $(nginx -v 2>&1 || true)"
-    fi
-
-    # Java
-    local java_ver
-    java_ver=$(java -version 2>&1 | head -1 || echo "")
-    if [[ -n "$java_ver" ]]; then
-        log_info "Java detected: $java_ver"
-        if echo "$java_ver" | grep -qE "1\.[678]"; then
-            log_high "Java 6/7/8 detected. EL8 ships OpenJDK 8, 11, 17. Verify app compatibility."
-        fi
-    fi
-
-    # Node.js
-    if command -v node &>/dev/null; then
-        log_info "Node.js detected: $(node --version 2>/dev/null)"
-        log_warn "Node.js from SCL or EPEL — verify EL8 module stream availability (node:14, 16, 18, 20)."
-    fi
-
-    # Ruby
-    if command -v ruby &>/dev/null; then
-        log_info "Ruby detected: $(ruby --version 2>/dev/null)"
-        log_warn "Ruby may need reinstallation from EL8 module streams."
-    fi
-
-    # Perl
-    if command -v perl &>/dev/null; then
-        log_info "Perl detected: $(perl --version 2>/dev/null | head -2 | tail -1)"
-    fi
-
-    # Docker / Podman / containerd
-    for ct in docker podman containerd crio; do
-        if command -v "$ct" &>/dev/null; then
-            log_warn "Container runtime '$ct' detected. Reconfigure with EL8 container-tools module."
-        fi
-    done
 
     # Kubernetes
-    if command -v kubectl &>/dev/null || command -v kubelet &>/dev/null; then
-        log_high "Kubernetes components detected. Upgrade k8s AFTER OS upgrade using k8s EL8 repos."
+    if command -v kubectl &>/dev/null 2>&1 || command -v kubelet &>/dev/null 2>&1; then
+        pf_warn "Kubernetes detected. Upgrade k8s AFTER OS upgrade using EL8 k8s repos."
     fi
 
-    # Ansible / Puppet / Chef / Salt
-    for mgmt in ansible puppet chef salt; do
-        if command -v "$mgmt" &>/dev/null 2>&1; then
-            log_warn "Config management tool '$mgmt' detected. Reinstall from EL8-compatible repos post-upgrade."
-        fi
-    done
-
-    # OpenVPN / WireGuard / VPN
-    if rpm -q openvpn &>/dev/null 2>&1; then
-        log_warn "OpenVPN detected. Verify kernel module compatibility post-upgrade."
-    fi
-    if rpm -q wireguard-tools &>/dev/null 2>&1; then
-        log_info "WireGuard detected. Built into EL8 kernel (5.x) — should work fine."
-    fi
-
-    # Check kernel modules
-    echo
-    echo "--- Loaded Kernel Modules ---"
-    lsmod | head -40
-    echo
-
-    # Check for custom kernel modules
+    # Custom kernel modules
     local extra_dir="/lib/modules/$(uname -r)/extra"
-    if [[ -d "$extra_dir" ]] && find "$extra_dir" -name "*.ko" 2>/dev/null | grep -q "."; then
-        log_high "Custom kernel modules detected in $extra_dir — these will NOT work with EL8 kernel."
-        find "$extra_dir" -name "*.ko" 2>/dev/null
+    if [[ -d "$extra_dir" ]] && find "$extra_dir" -name "*.ko" 2>/dev/null | grep -q .; then
+        pf_warn "Custom out-of-tree kernel modules found in $extra_dir. They will NOT work after kernel upgrade."
     else
-        log_ok "No custom kernel modules found in extra/."
+        pf_pass "No custom out-of-tree kernel modules."
+    fi
+
+    # SSSD
+    if rpm -q sssd &>/dev/null 2>&1; then
+        pf_info "SSSD detected (LDAP/AD/FreeIPA auth). Verify sssd config post-upgrade."
     fi
 }
 
-analyze_services() {
-    log_section "6. Running Services & Daemons"
+_pf_repos() {
+    local tp=()
+    while IFS= read -r rf; do
+        local rn; rn=$(basename "$rf" .repo)
+        echo "$rn" | grep -qiE "^(CentOS|base|updates|extras|epel|centos)" || tp+=("$rn")
+    done < <(find /etc/yum.repos.d/ -name "*.repo" 2>/dev/null)
 
-    echo "--- Systemd Services (enabled) ---"
-    systemctl list-unit-files --type=service --state=enabled 2>/dev/null
-    echo
-
-    echo "--- Currently Active Services ---"
-    systemctl list-units --type=service --state=active 2>/dev/null
-    echo
-
-    # Identify critical services
-    local critical_services=(sshd httpd nginx mysql mariadb postgresql redis rabbitmq mongod \
-                              elasticsearch kibana logstash kafka zookeeper)
-    echo "--- Critical Service Status ---"
-    for svc in "${critical_services[@]}"; do
-        if systemctl list-unit-files | grep -q "^${svc}"; then
-            local state
-            state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
-            echo "  $svc: $state"
-        fi
-    done
-    echo
-
-    # Cron jobs
-    echo "--- Cron Jobs ---"
-    crontab -l 2>/dev/null || echo "  (no root crontab)"
-    ls /etc/cron.d/ 2>/dev/null && cat /etc/cron.d/* 2>/dev/null || true
-    echo
-
-    # Systemd timers
-    echo "--- Systemd Timers ---"
-    systemctl list-timers --all 2>/dev/null | head -20
-    echo
-}
-
-analyze_security() {
-    log_section "7. Security Configuration"
-
-    # SSH
-    echo "--- SSH Configuration ---"
-    grep -v "^#\|^$" /etc/ssh/sshd_config 2>/dev/null | head -40
-    echo
-
-    # Check for non-standard SSH port
-    local ssh_port
-    ssh_port=$(grep -i "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-    log_info "SSH Port: ${ssh_port:-22}"
-
-    # Sudo config
-    echo "--- Sudoers ---"
-    grep -v "^#\|^$\|^Defaults" /etc/sudoers 2>/dev/null | head -20
-    echo
-
-    # Check for LUKS encryption
-    if command -v cryptsetup &>/dev/null; then
-        if cryptsetup status 2>/dev/null | grep -q "active"; then
-            log_warn "LUKS-encrypted device detected. Ensure encryption headers are preserved during backup."
-        fi
+    if [[ ${#tp[@]} -gt 0 ]]; then
+        pf_warn "Third-party repos: ${tp[*]}. Will be temporarily disabled during upgrade."
+    else
+        pf_pass "No third-party repos detected."
     fi
 
-    # Auditd
-    if systemctl is-active --quiet auditd 2>/dev/null; then
-        log_info "auditd is running — audit rules will need re-evaluation on EL8."
-    fi
-
-    # PAM
-    echo "--- PAM Configuration Summary ---"
-    ls /etc/pam.d/ | head -10
-    echo
-
-    # Fail2ban / intrusion detection
-    for ids in fail2ban aide ossec tripwire; do
-        if rpm -q "$ids" &>/dev/null 2>&1 || command -v "$ids" &>/dev/null 2>&1; then
-            log_warn "$ids detected — reconfigure from EL8-compatible packages post-upgrade."
-        fi
+    for r in percona mariadb mysql nginx elastic remi ius webtatic; do
+        find /etc/yum.repos.d/ -name "*.repo" -exec grep -li "$r" {} \; 2>/dev/null | grep -q . && \
+            pf_warn "Repo '$r' found. Verify EL8-compatible version exists."
     done
 }
 
-analyze_users() {
-    log_section "8. Users & Groups"
+_pf_security() {
+    local sel; sel=$(getenforce 2>/dev/null || echo "disabled")
+    pf_info "SELinux: $sel. leapp sets permissive during upgrade — re-enable enforcing post-upgrade."
 
-    echo "--- System Users (non-system UID ≥ 1000) ---"
-    awk -F: '$3 >= 1000 {print $1, $3, $6, $7}' /etc/passwd
-    echo
+    if command -v cryptsetup &>/dev/null 2>&1 && cryptsetup status 2>/dev/null | grep -q "active"; then
+        pf_warn "LUKS encryption detected. Ensure backup captures encrypted partition headers."
+    fi
 
-    echo "--- Groups with Members ---"
-    awk -F: '$4 != "" {print $1, $4}' /etc/group | head -20
-    echo
+    local sp; sp=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
+    pf_info "SSH port: ${sp:-22}. Verify firewall allows access post-upgrade."
+}
 
-    # Check for LDAP / AD / FreeIPA
-    if rpm -q sssd &>/dev/null 2>&1 || rpm -q sss_client &>/dev/null 2>&1; then
-        log_warn "SSSD detected (LDAP/AD/FreeIPA auth). Verify sssd config is compatible with EL8 sssd."
+_pf_services() {
+    local det=()
+    for s in sshd httpd nginx mysql mariadb postgresql redis mongod; do
+        systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service" && \
+            det+=("${s}:$(systemctl is-active "$s" 2>/dev/null || echo inactive)")
+    done
+    if [[ ${#det[@]} -gt 0 ]]; then
+        pf_info "Critical services detected: ${det[*]}. Verify each restarts correctly post-upgrade."
+    else
+        pf_pass "No critical application services detected."
     fi
 }
 
-analyze_applications_deep() {
-    log_section "9. Deep Application & Dependency Analysis"
+_pf_virt() {
+    local v; v=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+    pf_info "Virtualisation: $v"
+    [[ "$v" == "none" ]] && pf_info "Bare metal: ensure out-of-band console access (iDRAC/iLO) before upgrade."
+}
 
-    echo "--- All Installed Packages (grouped by origin) ---"
-    # Packages NOT from CentOS/RHEL repos
-    echo "  Third-party / Unknown origin packages:"
-    local third_party
-    third_party=$(rpm -qa --queryformat '%{NAME} %{VENDOR}\n' 2>/dev/null | \
-        grep -v -iE "centos|red hat|fedora" | sort | head -50 || true)
-    if [[ -n "$third_party" ]]; then
-        echo "$third_party"
-    else
-        echo "  (none detected — all packages from CentOS/Red Hat)"
+# --- master runner ------------------------------------------------------------
+run_preflight() {
+    log_section "PREFLIGHT ASSESSMENT"
+    preflight_reset
+    _pf_root; _pf_os; _pf_disk; _pf_network; _pf_tools
+    _pf_boot; _pf_packages; _pf_repos; _pf_security; _pf_services; _pf_virt
+}
+
+# --- report printer ----------------------------------------------------------
+print_preflight_report() {
+    echo
+    echo -e "${BOLD}${WHITE}╔══════════════════════════════════════════════════════════════╗${RESET}"
+    printf "${BOLD}${WHITE}║  PREFLIGHT REPORT  %-44s║${RESET}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "${BOLD}${WHITE}║  Host: %-54s║${RESET}\n" "$(hostname -f 2>/dev/null || hostname)"
+    echo -e "${BOLD}${WHITE}╚══════════════════════════════════════════════════════════════╝${RESET}"
+    echo
+
+    if [[ ${#PREFLIGHT_PASS[@]} -gt 0 ]]; then
+        echo -e "${GREEN}${BOLD}✔  PASSED (${#PREFLIGHT_PASS[@]})${RESET}"
+        for i in "${PREFLIGHT_PASS[@]}"; do echo -e "   ${GREEN}✔${RESET} $i"; done; echo
     fi
-    echo
 
-    # RPM scriptlets that may fail
-    echo "--- Packages with Post-install Scriptlets ---"
-    local scriptlets
-    scriptlets=$(rpm -qa --queryformat '%{NAME}\n' 2>/dev/null | \
-        xargs -I{} rpm -q --scripts {} 2>/dev/null | \
-        grep -B1 "postinstall\|preinstall" 2>/dev/null | \
-        grep -v "^--$" 2>/dev/null | head -30 || true)
-    if [[ -n "$scriptlets" ]]; then
-        echo "$scriptlets"
-    else
-        echo "  (none found)"
+    if [[ ${#PREFLIGHT_INFO[@]} -gt 0 ]]; then
+        echo -e "${BLUE}${BOLD}ℹ  INFORMATIONAL (${#PREFLIGHT_INFO[@]})${RESET}"
+        for i in "${PREFLIGHT_INFO[@]}"; do echo -e "   ${BLUE}ℹ${RESET} $i"; done; echo
     fi
+
+    if [[ ${#PREFLIGHT_AUTOS[@]} -gt 0 ]]; then
+        echo -e "${MAGENTA}${BOLD}⚙  AUTO-FIXABLE (${#PREFLIGHT_AUTOS[@]}) — will be fixed automatically${RESET}"
+        for i in "${PREFLIGHT_AUTOS[@]}"; do echo -e "   ${MAGENTA}⚙${RESET} $i"; done; echo
+    fi
+
+    if [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}${BOLD}⚠  WARNINGS — review before proceeding (${#PREFLIGHT_WARNS[@]})${RESET}"
+        for i in "${PREFLIGHT_WARNS[@]}"; do echo -e "   ${YELLOW}⚠${RESET} $i"; done; echo
+    fi
+
+    if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
+        echo -e "${RED}${BOLD}✖  BLOCKERS — MUST FIX BEFORE MIGRATION (${#PREFLIGHT_BLOCKS[@]})${RESET}"
+        for i in "${PREFLIGHT_BLOCKS[@]}"; do echo -e "   ${RED}✖${RESET} $i"; done; echo
+    fi
+
+    echo -e "${BOLD}${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
+        echo -e "  ${RED}${BOLD}VERDICT: ✖  NOT READY — Fix ${#PREFLIGHT_BLOCKS[@]} blocker(s) first.${RESET}"
+    elif [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}${BOLD}VERDICT: ⚠  PROCEED WITH CAUTION — ${#PREFLIGHT_WARNS[@]} warning(s) to review.${RESET}"
+    else
+        echo -e "  ${GREEN}${BOLD}VERDICT: ✔  GO — System is ready for migration.${RESET}"
+    fi
+    echo -e "${BOLD}${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo
 
-    # Shared libraries
-    echo "--- Missing Shared Libraries (ldd check on binaries) ---"
-    local broken_binaries=()
-    while IFS= read -r bin; do
-        if ldd "$bin" 2>&1 | grep -q "not found"; then
-            broken_binaries+=("$bin")
-            log_warn "Binary $bin has missing shared libraries NOW (pre-upgrade issue)"
-        fi
-    done < <(find /usr/bin /usr/sbin /usr/local/bin -type f -executable 2>/dev/null | head -100)
-    [[ ${#broken_binaries[@]} -eq 0 ]] && log_ok "No pre-existing broken shared library links found."
-    echo
-
-    # SCL (Software Collections)
-    if rpm -q centos-release-scl &>/dev/null 2>&1 || rpm -q scl-utils &>/dev/null 2>&1; then
-        log_high "Software Collections (SCL) detected. SCL is NOT supported in EL8 — applications must be migrated to AppStream module streams."
-        echo "--- SCL packages ---"
-        scl --list 2>/dev/null || rpm -qa | grep "^rh-\|^devtoolset-\|^python27\|^python36"
+    # Save to file
+    {
+        echo "PREFLIGHT REPORT — $(date)"
+        echo "Host: $(hostname -f 2>/dev/null || hostname) | Script: v$SCRIPT_VERSION"
+        echo "════════════════════════════════════════════"
+        echo; echo "PASSED (${#PREFLIGHT_PASS[@]}):"
+        for i in "${PREFLIGHT_PASS[@]}"; do echo "  [PASS]  $i"; done
+        echo; echo "INFORMATIONAL:"
+        for i in "${PREFLIGHT_INFO[@]}"; do echo "  [INFO]  $i"; done
+        echo; echo "AUTO-FIXABLE:"
+        for i in "${PREFLIGHT_AUTOS[@]}"; do echo "  [AUTO]  $i"; done
+        echo; echo "WARNINGS:"
+        for i in "${PREFLIGHT_WARNS[@]}"; do echo "  [WARN]  $i"; done
+        echo; echo "BLOCKERS:"
+        for i in "${PREFLIGHT_BLOCKS[@]}"; do echo "  [BLOCK] $i"; done
         echo
-    fi
+        if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then echo "VERDICT: NOT READY"
+        elif [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then echo "VERDICT: PROCEED WITH CAUTION"
+        else echo "VERDICT: GO"; fi
+    } > "$REPORT_FILE"
 
-    # Check config files that will differ
-    echo "--- Key Configuration Files to Review Post-Upgrade ---"
-    local config_files=(/etc/httpd/conf/httpd.conf /etc/nginx/nginx.conf /etc/my.cnf \
-                         /etc/php.ini /etc/sysconfig/network-scripts/ /etc/NetworkManager/ \
-                         /etc/postfix/main.cf /etc/dovecot/dovecot.conf)
-    for cf in "${config_files[@]}"; do
-        [[ -e "$cf" ]] && echo "  EXISTS: $cf"
-    done
-    echo
-
-    # Logs analysis for recurring errors
-    echo "--- Recent Errors in System Logs (last 200 lines) ---"
-    journalctl -p err --no-pager -n 50 2>/dev/null | tail -30 || \
-        grep -i "error\|critical\|failed" /var/log/messages 2>/dev/null | tail -30 || true
-    echo
+    log_info "Report: $REPORT_FILE"
 }
 
-check_disk_space_for_upgrade() {
-    log_section "10. Disk Space Check for Upgrade"
+# ===========================================================================
+#  SECTION 2 — AUTO-FIX
+# ===========================================================================
 
-    # Minimum requirements for leapp/elevate
-    local root_avail
-    root_avail=$(df --output=avail -BG / | tail -1 | tr -d 'G')
-    local boot_avail
-    boot_avail=$(df --output=avail -BG /boot 2>/dev/null | tail -1 | tr -d 'G' || echo "0")
+run_autofix() {
+    log_section "AUTO-FIX: Applying Safe Remediations"
 
-    log_info "Available on /: ${root_avail}G"
-    log_info "Available on /boot: ${boot_avail}G"
-
-    if [[ "$root_avail" -lt 10 ]]; then
-        log_critical "/: Only ${root_avail}G available. ELevate requires ≥10G on /. FREE SPACE BEFORE PROCEEDING."
-    else
-        log_ok "/ has sufficient space (${root_avail}G ≥ 10G required)."
+    # IPv6 — disable if broken
+    local ipv6_off
+    ipv6_off=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "1")
+    if [[ "$ipv6_off" == "0" ]] && ! ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
+        log_info "Disabling broken IPv6..."
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
+        sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
+        grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null || \
+            printf '\n# el8-migration: IPv6 disabled\nnet.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\n' >> /etc/sysctl.conf
+        log_ok "IPv6 disabled."
     fi
 
-    if [[ "$boot_avail" -lt 1 ]]; then
-        log_critical "/boot: Only ${boot_avail}G available. Need ≥1G. Remove old kernels: package-cleanup --oldkernels"
-    else
-        log_ok "/boot has sufficient space."
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# SECTION 2: BACKUP TO BLOCK DEVICE
-# ---------------------------------------------------------------------------
-backup_to_block_device() {
-    log_section "BACKUP: Disk Image to Block Device"
-
-    if [[ -z "$BACKUP_DEV" ]]; then
-        log_warn "No backup device specified (--backup-dev). Skipping backup."
-        return 0
+    # Old kernels
+    local kcount; kcount=$(rpm -q kernel 2>/dev/null | wc -l || echo "0")
+    if [[ "$kcount" -gt 2 ]]; then
+        log_info "Removing old kernels..."
+        package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
+        log_ok "Old kernels removed."
     fi
 
-    if [[ ! -b "$BACKUP_DEV" ]]; then
-        die "Backup device '$BACKUP_DEV' is not a valid block device."
+    # ABRT
+    local abrt; abrt=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
+    if [[ -n "$abrt" ]]; then
+        log_info "Removing ABRT packages (safe, no cascade)..."
+        echo "$abrt" | xargs yum remove -y \
+            --setopt=clean_requirements_on_remove=0 2>/dev/null || true
+        log_ok "ABRT removed."
     fi
 
-    # Identify source disk (disk containing /)
-    local root_dev
-    root_dev=$(df / | tail -1 | awk '{print $1}')
-    # If on LVM, find the underlying disk
-    local source_disk
-    if echo "$root_dev" | grep -q "mapper"; then
-        source_disk=$(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}' | head -1)
-        # Trim partition number to get disk
-        source_disk=$(echo "$source_disk" | sed 's/[0-9]*$//')
-    else
-        source_disk=$(echo "$root_dev" | sed 's/[0-9]*$//')
-    fi
-
-    log_info "Source disk detected: $source_disk"
-    log_info "Backup target device: $BACKUP_DEV"
-
-    # Size check
-    local src_size dest_size
-    src_size=$(lsblk -bno SIZE "$source_disk" 2>/dev/null | head -1)
-    dest_size=$(lsblk -bno SIZE "$BACKUP_DEV" 2>/dev/null | head -1)
-
-    log_info "Source size: $(numfmt --to=iec "$src_size")"
-    log_info "Destination size: $(numfmt --to=iec "$dest_size")"
-
-    if [[ "$dest_size" -lt "$src_size" ]]; then
-        die "Backup device ($BACKUP_DEV) is smaller than source disk ($source_disk). Backup aborted."
-    fi
-
-    echo
-    log_warn "BACKUP OPERATION: This will OVERWRITE all data on $BACKUP_DEV."
-    log_warn "Source: $source_disk → Destination: $BACKUP_DEV"
-    echo
-
-    if ! confirm "Proceed with disk image backup? (THIS WILL ERASE $BACKUP_DEV)"; then
-        log_info "Backup skipped by user."
-        return 0
-    fi
-
-    # Sync filesystems
-    log_info "Syncing filesystems..."
-    sync
-
-    # Flush caches
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-
-    log_info "Starting dd backup — this may take a long time..."
-    log_info "Progress is shown below (update every 10 seconds)."
-
-    local backup_start
-    backup_start=$(date +%s)
-
-    if command -v pv &>/dev/null; then
-        # pv gives a nice progress bar
-        pv -tpreb "$source_disk" | dd of="$BACKUP_DEV" bs=4M conv=noerror,sync 2>&1
-    else
-        # dd with progress (GNU dd)
-        dd if="$source_disk" of="$BACKUP_DEV" bs=4M conv=noerror,sync status=progress 2>&1
-    fi
-
-    local backup_end
-    backup_end=$(date +%s)
-    local elapsed=$(( backup_end - backup_start ))
-    log_ok "Backup completed in ${elapsed}s."
-
-    # Verify backup with hash comparison (first 512MB)
-    log_info "Verifying backup integrity (comparing first 512MB of source vs backup)..."
-    local src_hash dest_hash
-    src_hash=$(dd if="$source_disk" bs=1M count=512 2>/dev/null | md5sum | awk '{print $1}')
-    dest_hash=$(dd if="$BACKUP_DEV"  bs=1M count=512 2>/dev/null | md5sum | awk '{print $1}')
-
-    if [[ "$src_hash" == "$dest_hash" ]]; then
-        log_ok "Backup integrity verified (MD5 match: $src_hash)."
-    else
-        log_error "MD5 MISMATCH — backup may be corrupt!"
-        log_error "Source: $src_hash"
-        log_error "Backup: $dest_hash"
-        die "Backup verification failed. DO NOT PROCEED with upgrade."
-    fi
-
-    # Store backup metadata
-    cat > "${LOG_DIR}/backup_metadata_${START_TIME}.txt" <<EOF
-Backup Date     : $(date)
-Source Disk     : $source_disk
-Source Size     : $(numfmt --to=iec "$src_size")
-Backup Device   : $BACKUP_DEV
-Duration        : ${elapsed}s
-MD5 (first 512M): $src_hash
-Kernel          : $(uname -r)
-OS              : $(cat /etc/centos-release)
-
-To RESTORE from backup:
-  dd if=$BACKUP_DEV of=$source_disk bs=4M conv=noerror,sync status=progress
-  # Then run: grub2-install $source_disk && grub2-mkconfig -o /boot/grub2/grub.cfg
-EOF
-
-    log_ok "Backup metadata saved to ${LOG_DIR}/backup_metadata_${START_TIME}.txt"
-    log_info "RESTORE COMMAND: dd if=$BACKUP_DEV of=$source_disk bs=4M conv=noerror,sync status=progress"
-}
-
-# ---------------------------------------------------------------------------
-# SECTION 3: PRE-UPGRADE PREPARATION
-# ---------------------------------------------------------------------------
-prepare_system() {
-    log_section "Pre-Upgrade System Preparation"
-
-    # 1. Full system update on CentOS 7 first
-    log_info "Step 1: Updating all CentOS 7 packages to latest..."
-    yum update -y 2>&1 | tail -20
-    log_ok "System fully updated."
-
-    # 2. Clean yum cache
-    log_info "Step 2: Cleaning yum cache..."
-    yum clean all
-    rm -rf /var/cache/yum
-
-    # 3. Remove known conflicting packages
-    log_info "Step 3: Removing packages known to conflict with ELevate..."
-    local conflict_pkgs=(
-        centos-release-scl centos-release-scl-rh
-        python2-virtualenv python-virtualenv
-        abrt abrt-addon-ccpp abrt-addon-kerneloops abrt-addon-pstoreoops
-        abrt-addon-python abrt-addon-vmcore abrt-addon-xorg abrt-cli
-        abrt-console-notification abrt-libs abrt-plugin-sosreport
-        libreport libreport-cli libreport-filesystem libreport-plugin-bugzilla
-        libreport-plugin-logger libreport-plugin-mailx libreport-plugin-reportuploader
-        libreport-python libreport-web
-    )
-    for pkg in "${conflict_pkgs[@]}"; do
-        if rpm -q "$pkg" &>/dev/null 2>&1; then
-            log_info "Removing $pkg..."
-            yum remove -y "$pkg" 2>/dev/null || log_warn "Could not remove $pkg — continuing."
-        fi
+    # Missing tools
+    local miss=()
+    for t in rpm yum curl lsblk df free uname ss ip awk grep sed; do
+        command -v "$t" &>/dev/null || miss+=("$t")
     done
-
-    # 4. Remove old kernels (keep only 1)
-    log_info "Step 4: Removing old kernels (keeping latest only)..."
-    package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
-
-    # 5. Install EPEL if not present (needed for elevate)
-    if ! rpm -q epel-release &>/dev/null 2>&1; then
-        log_info "Step 5: Installing EPEL..."
-        yum install -y epel-release
+    if [[ ${#miss[@]} -gt 0 ]]; then
+        log_info "Installing missing tools: ${miss[*]}"
+        yum install -y "${miss[@]}" 2>/dev/null || log_warn "Some tools could not install."
     fi
 
-    # 6. Disable problematic third-party repos temporarily
-    log_info "Step 6: Disabling third-party repos (will be re-enabled post-upgrade)..."
-    find /etc/yum.repos.d/ -name "*.repo" \
-        ! -name "CentOS-*.repo" \
-        ! -name "epel*.repo" \
-        -exec bash -c 'sed -i "s/^enabled=1/enabled=0/" "$1"' _ {} \;
-    log_ok "Third-party repos disabled for upgrade."
-
-    # 7. Snapshot currently installed packages for comparison
-    rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort \
-        > "${LOG_DIR}/packages_before_${START_TIME}.txt"
-    log_ok "Pre-upgrade package list saved to ${LOG_DIR}/packages_before_${START_TIME}.txt"
-
-    # 8. Backup critical config directories
-    log_info "Step 7: Backing up critical configs..."
-    local cfg_backup_dir="${LOG_DIR}/config_backup_${START_TIME}"
-    mkdir -p "$cfg_backup_dir"
-    for dir in /etc/httpd /etc/nginx /etc/mysql /etc/my.cnf.d /etc/php.ini \
-                /etc/php.d /etc/postfix /etc/dovecot /etc/ssh /etc/cron.d \
-                /etc/sysconfig/network-scripts /etc/NetworkManager; do
-        [[ -e "$dir" ]] && cp -a "$dir" "$cfg_backup_dir/" 2>/dev/null && \
-            log_info "  Backed up: $dir"
-    done
-    log_ok "Config backups → $cfg_backup_dir"
-}
-
-# ---------------------------------------------------------------------------
-# SECTION 4: ELEVATE / LEAPP UPGRADE
-# ---------------------------------------------------------------------------
-
-# Locate the leapp binary — tries known paths, PATH, full filesystem search,
-# and as a last resort attempts to install the missing leapp package.
-resolve_leapp_bin() {
-    # -----------------------------------------------------------------------
-    # Stage 1: Check all known fixed binary paths
-    # -----------------------------------------------------------------------
-    local candidates=(
-        /usr/bin/leapp
-        /bin/leapp
-        /usr/local/bin/leapp
-        /usr/lib/python2.7/site-packages/leapp/bin/leapp
-    )
-    for p in "${candidates[@]}"; do
-        if [[ -x "$p" ]]; then
-            LEAPP_BIN="$p"
-            log_ok "leapp binary found at: $LEAPP_BIN"
-            return 0
-        fi
-    done
-
-    # Stage 2: Check PATH
-    if command -v leapp &>/dev/null 2>&1; then
-        LEAPP_BIN="$(command -v leapp)"
-        log_ok "leapp binary found via PATH: $LEAPP_BIN"
-        return 0
-    fi
-
-    # Stage 3: Full filesystem search for any executable named leapp
-    log_info "Searching filesystem for leapp binary..."
-    local found
-    found=$(find / -name "leapp" -type f -executable 2>/dev/null             | grep -v proc | grep -v sys | head -1)
-    if [[ -n "$found" ]]; then
-        LEAPP_BIN="$found"
-        log_ok "leapp binary found via filesystem search: $LEAPP_BIN"
-        return 0
-    fi
-
-    # Stage 4: Query RPM to find what file the installed package provides
-    log_info "Checking RPM file lists for leapp binary location..."
-    local rpm_leapp_bin
-    rpm_leapp_bin=$(rpm -ql leapp 2>/dev/null | grep -E "bin/leapp$" | head -1)
-    if [[ -z "$rpm_leapp_bin" ]]; then
-        rpm_leapp_bin=$(rpm -ql python2-leapp 2>/dev/null | grep -E "bin/leapp$" | head -1)
-    fi
-    if [[ -z "$rpm_leapp_bin" ]]; then
-        rpm_leapp_bin=$(rpm -ql leapp-upgrade-el7toel8 2>/dev/null | grep -E "bin/leapp$" | head -1)
-    fi
-    if [[ -n "$rpm_leapp_bin" ]] && [[ -x "$rpm_leapp_bin" ]]; then
-        LEAPP_BIN="$rpm_leapp_bin"
-        log_ok "leapp binary found via RPM file list: $LEAPP_BIN"
-        return 0
-    fi
-
-    # Stage 5: Binary not installed — try every known package that provides it
-    log_warn "leapp binary not found — trying to install provider packages..."
-    local provider_pkgs=(leapp python2-leapp leapp-framework)
-    for pkg in "${provider_pkgs[@]}"; do
-        log_info "  Trying: yum install -y $pkg ..."
-        yum install -y "$pkg" 2>&1 | tail -5 || true
-        # Re-check immediately after each install attempt
-        for p in /usr/bin/leapp /bin/leapp; do
-            if [[ -x "$p" ]]; then
-                LEAPP_BIN="$p"
-                log_ok "leapp binary available after installing $pkg: $LEAPP_BIN"
-                return 0
-            fi
-        done
-        if command -v leapp &>/dev/null 2>&1; then
-            LEAPP_BIN="$(command -v leapp)"
-            log_ok "leapp binary available after installing $pkg: $LEAPP_BIN"
-            return 0
-        fi
-    done
-
-    # Stage 6: Final diagnostic dump and hard exit
-    echo
-    log_error "================================================================"
-    log_error "FATAL: leapp binary cannot be found or installed."
-    log_error "Installed leapp-related packages:"
-    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" |         while read -r pkg; do log_error "  $pkg"; done
-    log_error "Files provided by installed leapp packages:"
-    for pkg in leapp python2-leapp leapp-upgrade-el7toel8; do
-        if rpm -q "$pkg" &>/dev/null 2>&1; then
-            rpm -ql "$pkg" 2>/dev/null | grep -v "^(contains no files)" |                 while read -r f; do log_error "  [$pkg] $f"; done
-        fi
-    done
-    log_error "ELevate repo status:"
-    yum repolist all 2>/dev/null | grep -i elevate |         while read -r l; do log_error "  $l"; done
-    log_error "----------------------------------------------------------------"
-    log_error "Manual fix options:"
-    log_error "  1. yum-config-manager --enable elevate && yum install -y leapp"
-    log_error "  2. Check: rpm -ql leapp-upgrade-el7toel8 | grep bin"
-    log_error "  3. Check ELevate docs: https://wiki.almalinux.org/elevate/"
-    log_error "================================================================"
-    die "Cannot proceed without leapp binary. See diagnostics above."
-}
-
-install_elevate() {
-    log_section "Installing ELevate (leapp-based upgrade tool)"
-
-    local elevate_url="https://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm"
-
-    # Step 1: Install elevate-release repo package
-    if rpm -q elevate-release &>/dev/null 2>&1; then
-        log_ok "elevate-release already installed."
-    else
-        log_info "Installing ELevate release package..."
-        yum install -y "$elevate_url" 2>&1 | tail -10
-        log_ok "elevate-release installed."
-    fi
-
-    # Step 2: Force-enable the elevate repo (defaults to disabled after install)
-    log_info "Enabling ELevate repo..."
-    yum-config-manager --enable elevate &>/dev/null 2>&1 ||         sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
-    yum clean all &>/dev/null
-    log_ok "ELevate repo enabled."
-
-    # Step 3: Install ALL leapp packages in one transaction
-    # Note: leapp-upgrade-el7toel8 is the actual package that provides
-    # the /usr/bin/leapp binary via Python entry_points on this ELevate version.
-    # We install every known package name so it works across all ELevate versions.
-    log_info "Installing all leapp packages..."
-    case "$TARGET_DISTRO" in
-        alma)
-            yum install -y                 leapp                 python2-leapp                 leapp-upgrade                 leapp-data-almalinux                 2>&1 | tail -30
-            ;;
-        rocky)
-            yum install -y                 leapp                 python2-leapp                 leapp-upgrade                 leapp-data-rocky                 2>&1 | tail -30
-            ;;
-        *)
-            die "Unknown target distro: $TARGET_DISTRO"
-            ;;
-    esac
-
-    # Step 4: Verify distro data package landed
-    case "$TARGET_DISTRO" in
-        alma)
-            if ! rpm -q leapp-data-almalinux &>/dev/null 2>&1; then
-                die "leapp-data-almalinux failed to install. Check ELevate repo."
-            fi ;;
-        rocky)
-            if ! rpm -q leapp-data-rocky &>/dev/null 2>&1; then
-                die "leapp-data-rocky failed to install. Check ELevate repo."
-            fi ;;
-    esac
-
-    log_info "Installed leapp-related packages:"
-    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" |         while read -r p; do log_info "  $p"; done
-
-    # Step 5: Resolve binary — sets global LEAPP_BIN
-    resolve_leapp_bin
-}
-run_preupgrade_check() {
-    log_section "Running leapp pre-upgrade analysis..."
-
-    log_info "This performs a DRY RUN — no changes are made to the system."
-    $LEAPP_BIN preupgrade 2>&1 | tee "${LOG_DIR}/leapp_preupgrade_${START_TIME}.log"
-
-    echo
-    log_info "Reviewing leapp pre-upgrade report..."
-
-    if [[ -f /var/log/leapp/leapp-report.txt ]]; then
-        cp /var/log/leapp/leapp-report.txt "${LOG_DIR}/leapp_report_${START_TIME}.txt"
-        cat /var/log/leapp/leapp-report.txt
-
-        # Check for inhibitors
-        if grep -q "Inhibitor" /var/log/leapp/leapp-report.txt; then
-            log_warn "Inhibitors found in first preupgrade run — attempting auto-remediation..."
-            echo
-            echo "--- INHIBITORS DETECTED ---"
-            grep -A5 "Inhibitor" /var/log/leapp/leapp-report.txt || true
-            echo
-
-            # Auto-fix known inhibitors then re-run preupgrade
-            fix_leapp_inhibitors
-
-            log_info "Re-running leapp preupgrade after remediation..."
-            leapp preupgrade 2>&1 | tee "${LOG_DIR}/leapp_preupgrade2_${START_TIME}.log"
-
-            if [[ -f /var/log/leapp/leapp-report.txt ]]; then
-                cp /var/log/leapp/leapp-report.txt "${LOG_DIR}/leapp_report2_${START_TIME}.txt"
-            fi
-
-            if grep -q "Inhibitor" /var/log/leapp/leapp-report.txt 2>/dev/null; then
-                log_critical "INHIBITORS STILL PRESENT after auto-remediation."
-                log_critical "Manual intervention required. Review:"
-                log_critical "  cat /var/log/leapp/leapp-report.txt"
-                echo
-                grep -A8 "Inhibitor" /var/log/leapp/leapp-report.txt || true
-                echo
-                if ! confirm "Inhibitors remain. Force continue anyway? (UPGRADE WILL LIKELY FAIL)"; then
-                    die "Upgrade aborted — inhibitors not resolved."
-                fi
-            else
-                log_ok "All inhibitors resolved after auto-remediation."
-            fi
-        else
-            log_ok "No leapp inhibitors found."
-        fi
-    else
-        log_warn "leapp-report.txt not found. Review /var/log/leapp/ manually."
-    fi
-}
-
-# =============================================================================
-# UNIVERSAL LEAPP INHIBITOR REMEDIATION ENGINE
-# -----------------------------------------------------------------------------
-# This function works for ALL EL7→EL8 and EL8→EL9 upgrades.
-# Strategy:
-#   1. Apply ALL known leapp answerfile entries upfront
-#   2. Dynamically parse leapp-report.txt and blacklist ANY removed drivers
-#   3. Apply known HIGH-risk non-inhibitor fixes (postfix, python, etc.)
-#   4. Handle every inhibitor category leapp can generate
-# =============================================================================
-fix_leapp_inhibitors() {
-    log_section "Universal leapp Inhibitor Remediation"
-
-    # -------------------------------------------------------------------------
-    # STEP 1: Apply ALL known leapp answerfile entries
-    # These cover every interactive prompt leapp may raise across EL7→EL8/EL9
-    # -------------------------------------------------------------------------
-    log_info "Step 1: Applying all known leapp answerfile entries..."
-    local leapp_answers=(
-        "remove_pam_pkcs11_module_check.confirm=True"
-        "authselect_check.confirm=True"
-        "remove_ifcfg_files_check.confirm=True"
-        "grub_enableos_prober_check.confirm=True"
-        "verify_check_results.confirm=True"
-    )
-    for answer in "${leapp_answers[@]}"; do
-        $LEAPP_BIN answer --section "$answer" 2>/dev/null &&             log_ok "  Answered: $answer" || true
-    done
-
-    # -------------------------------------------------------------------------
-    # STEP 2: Dynamically detect and blacklist ALL removed kernel drivers
-    # Parses leapp-report.txt to find whatever drivers leapp flagged —
-    # works universally regardless of which drivers are on this specific system
-    # -------------------------------------------------------------------------
-    log_info "Step 2: Detecting removed kernel drivers from leapp report..."
-
-    # Run a quick preupgrade if report doesn't exist yet
-    if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
-        log_info "  No leapp report found yet — running initial preupgrade scan..."
-        $LEAPP_BIN preupgrade 2>/dev/null || true
-    fi
-
-    if [[ -f /var/log/leapp/leapp-report.txt ]]; then
-        # Extract driver names from the report dynamically
-        # Handles both "removed in RHEL 8" and "no longer maintained" sections
-        local report_drivers=()
-        while IFS= read -r line; do
-            # Lines starting with "     - <driver_name>" under kernel driver sections
-            if echo "$line" | grep -qE "^\s+- [a-z0-9_]+$"; then
-                local drv
-                drv=$(echo "$line" | tr -d ' -')
-                # Only process if it looks like a kernel module name
-                if [[ "$drv" =~ ^[a-z0-9_]+$ ]] && [[ ${#drv} -lt 40 ]]; then
-                    report_drivers+=("$drv")
-                fi
-            fi
-        done < <(grep -A 20 "kernel drivers" /var/log/leapp/leapp-report.txt 2>/dev/null || true)
-
-        if [[ ${#report_drivers[@]} -gt 0 ]]; then
-            log_info "  Drivers to blacklist: ${report_drivers[*]}"
-            for drv in "${report_drivers[@]}"; do
-                _blacklist_driver "$drv"
-            done
-        else
-            log_info "  No removed kernel drivers detected in leapp report."
-        fi
-    fi
-
-    # Always blacklist the universal set of commonly removed drivers
-    # across all EL7→EL8 and EL8→EL9 upgrades regardless of report content
-    log_info "Step 3: Blacklisting universally removed drivers..."
-    local universal_removed_drivers=(
-        # EL7 → EL8 removed drivers
-        pata_acpi        # Legacy PATA/IDE controller
-        floppy           # Floppy disk (removed in EL8)
-        isdn             # ISDN subsystem
-        nozomi           # 3G WWAN card
-        aoe              # ATA over Ethernet
-        # EL8 → EL9 additionally removed drivers
-        snd_emu10k1_synth
-        acerhdf
-        asus_acpi
-        bcm203x
-        bpa10x
-        btusb_rtl
-        lirc_serial
-        mptbase
-        mptctl
-        mptfc
-        mptlan
-        mptsas
-        mptscsih
-        mptspi
-        mtdblock
-        n_hdlc
-        pch_gbe
-        snd_atiixp_modem
-        snd_via82xx_modem
-        ueagle_atm
-        usbatm
-        xusbatm
-    )
-    for drv in "${universal_removed_drivers[@]}"; do
-        # Only blacklist if currently loaded OR if in the leapp report
-        if lsmod 2>/dev/null | grep -q "^${drv} " ||            grep -q "$drv" /var/log/leapp/leapp-report.txt 2>/dev/null; then
-            _blacklist_driver "$drv"
-        fi
-    done
-
-    # -------------------------------------------------------------------------
-    # STEP 4: VDO (Virtual Data Optimizer) — inhibitor on some systems
-    # -------------------------------------------------------------------------
-    if systemctl is-active --quiet vdo 2>/dev/null; then
-        log_warn "VDO service detected. Stopping before upgrade..."
-        systemctl stop vdo 2>/dev/null || true
-        systemctl disable vdo 2>/dev/null || true
-        log_ok "VDO stopped and disabled."
-    fi
-
-    # -------------------------------------------------------------------------
-    # STEP 5: Network interface name inhibitor
-    # If system uses old-style eth0 naming, leapp may inhibit
-    # -------------------------------------------------------------------------
-    if ip link show 2>/dev/null | grep -q "^[0-9]*: eth[0-9]"; then
-        log_warn "Legacy network interface name (eth0) detected."
-        log_warn "Adding net.ifnames=0 biosdevname=0 to kernel args for upgrade..."
-        grubby --update-kernel=ALL --args="net.ifnames=0 biosdevname=0" 2>/dev/null || true
-    fi
-
-    # -------------------------------------------------------------------------
-    # STEP 6: Postfix compatibility — prevents mail service breakage
-    # -------------------------------------------------------------------------
-    if command -v postconf &>/dev/null 2>&1; then
-        log_info "Setting Postfix compatibility_level=2..."
-        postconf -e compatibility_level=2 2>/dev/null || true
-        log_ok "Postfix compatibility_level=2 set."
-    fi
-
-    # -------------------------------------------------------------------------
-    # STEP 7: Remove remaining ABRT packages if still present
-    # IMPORTANT: Use --noautoremove to prevent yum from cascade-removing
-    # leapp-upgrade-el7toel8 and other packages that depend on libreport.
-    # -------------------------------------------------------------------------
-    log_info "Removing any remaining ABRT packages (safe mode — no autoremove)..."
-    local abrt_pkgs
-    abrt_pkgs=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
-    if [[ -n "$abrt_pkgs" ]]; then
-        log_info "  Found ABRT packages: removing safely..."
-        # Remove only explicit abrt packages — NOT libreport which leapp depends on
-        # Use --setopt=clean_requirements_on_remove=0 to prevent cascade removal
-        echo "$abrt_pkgs" | xargs yum remove -y             --setopt=clean_requirements_on_remove=0 2>/dev/null || true
-        log_ok "  ABRT packages removed."
-    else
-        log_ok "  No ABRT packages found."
-    fi
-
-    # Safety check: if leapp packages were accidentally removed, reinstall them
-    if ! rpm -q leapp-upgrade &>/dev/null 2>&1 &&        ! rpm -q leapp-upgrade-el7toel8 &>/dev/null 2>&1; then
-        log_warn "leapp-upgrade was removed as a dependency — reinstalling..."
-        yum-config-manager --enable elevate &>/dev/null 2>&1 || true
-        case "$TARGET_DISTRO" in
-            alma) yum install -y leapp leapp-upgrade leapp-data-almalinux 2>&1 | tail -10 || true ;;
-            rocky) yum install -y leapp leapp-upgrade leapp-data-rocky 2>&1 | tail -10 || true ;;
-        esac
-        log_ok "leapp packages restored."
-    fi
-
-    # -------------------------------------------------------------------------
-    # STEP 8: Fix /etc/redhat-release symlink issues (affects some minimal installs)
-    # -------------------------------------------------------------------------
+    # redhat-release symlink
     if [[ ! -f /etc/redhat-release ]] && [[ -f /etc/centos-release ]]; then
         ln -sf /etc/centos-release /etc/redhat-release 2>/dev/null || true
         log_ok "Fixed /etc/redhat-release symlink."
     fi
 
-    # -------------------------------------------------------------------------
-    # STEP 9: Ensure required leapp directories exist
-    # -------------------------------------------------------------------------
-    mkdir -p /var/log/leapp /etc/leapp/files 2>/dev/null || true
-
-    # -------------------------------------------------------------------------
-    # STEP 10: Disable IPv6 if not functional
-    # leapp's systemd-nspawn container inherits the host network stack.
-    # If IPv6 is enabled but has no working connectivity, dnf inside the
-    # container will try AAAA records first, hang on connect, and ALL
-    # AlmaLinux/Rocky 8 repos will fail to sync — causing the
-    # "Unable to install RHEL 8 userspace packages" error.
-    # -------------------------------------------------------------------------
-    log_info "Step 10: Checking IPv6 connectivity for leapp nspawn container..."
-    local ipv6_working=false
-    # Test IPv6 by trying to reach a well-known IPv6 address (Google DNS)
-    if ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
-        ipv6_working=true
-    fi
-
-    if [[ "$ipv6_working" == "false" ]]; then
-        local ipv6_disabled
-        ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
-        if [[ "$ipv6_disabled" == "0" ]]; then
-            log_warn "IPv6 is enabled but not working — disabling to prevent leapp repo failures."
-            log_warn "  (leapp's dnf tries IPv6 first; broken IPv6 causes all repo syncs to hang/fail)"
-            # Apply immediately via sysctl
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
-            # Persist across reboots
-            if ! grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
-                cat >> /etc/sysctl.conf <<'SYSCTL'
-
-# Disabled by migration script: IPv6 not functional on this host
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-SYSCTL
-            fi
-            log_ok "IPv6 disabled (sysctl applied immediately + persisted to /etc/sysctl.conf)."
-            log_info "  Note: Re-enable IPv6 post-upgrade if needed: sysctl -w net.ipv6.conf.all.disable_ipv6=0"
-        else
-            log_ok "IPv6 already disabled — no action needed."
-        fi
-    else
-        log_ok "IPv6 connectivity confirmed — no changes needed."
-    fi
-
-    # -------------------------------------------------------------------------
-    # SUMMARY: Log all remaining items from leapp report for awareness
-    # -------------------------------------------------------------------------
-    log_info "Step 11: Non-inhibitor HIGH risk items (informational):"
-    log_info "  • e1000 driver     → replaced by e1000e in EL8/EL9 (automatic)"
-    log_info "  • Python 2         → run 'alternatives --set python /usr/bin/python3' post-upgrade"
-    log_info "  • SELinux           → leapp sets permissive; re-enable enforcing post-upgrade"
-    log_info "  • GRUB2 update     → leapp runs grub2-install automatically on BIOS systems"
-    log_info "  • chrony config    → review /etc/chrony.conf post-upgrade if using leap smearing NTP"
-
-    log_ok "Universal inhibitor remediation complete."
+    log_ok "Auto-fix complete. Re-run --assess to verify."
 }
 
-# Helper: blacklist a single kernel module safely
+# ===========================================================================
+#  SECTION 3 — MIGRATION PHASES
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Phase 1: Select target distro
+# ---------------------------------------------------------------------------
+phase_select_target() {
+    log_section "Phase 1/6: Select Target Distribution"
+
+    if [[ -n "$TARGET_DISTRO" ]]; then
+        [[ "$TARGET_DISTRO" == "alma" || "$TARGET_DISTRO" == "rocky" ]] || \
+            die "Invalid --target '$TARGET_DISTRO'. Use 'alma' or 'rocky'."
+        log_ok "Target: $TARGET_DISTRO (from command line)"
+        state_set "TARGET_DISTRO" "$TARGET_DISTRO"; return 0
+    fi
+
+    local saved; saved=$(state_get "TARGET_DISTRO")
+    if [[ -n "$saved" ]]; then
+        echo -e "\n  Previously selected: ${BOLD}${saved^^} Linux 8${RESET}"
+        if confirm "Use $saved?"; then
+            TARGET_DISTRO="$saved"; log_ok "Target: $TARGET_DISTRO (restored)"; return 0
+        fi
+    fi
+
+    echo
+    echo -e "  ${BOLD}Select target distribution:${RESET}"
+    echo -e "  ${CYAN}1)${RESET} AlmaLinux 8  — backed by CloudLinux.  EOL: 2029-03-01"
+    echo -e "  ${CYAN}2)${RESET} Rocky Linux 8 — founded by CentOS co-founder.  EOL: 2029-05-31"
+    echo
+    echo -en "  ${YELLOW}Choice [1/2]: ${RESET}"
+    local ch; read -r ch
+    case "$ch" in
+        1) TARGET_DISTRO="alma" ;;
+        2) TARGET_DISTRO="rocky" ;;
+        *) die "Invalid choice." ;;
+    esac
+
+    log_ok "Target: ${TARGET_DISTRO^^} Linux 8"
+    state_set "TARGET_DISTRO" "$TARGET_DISTRO"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2: Backup
+# ---------------------------------------------------------------------------
+phase_backup() {
+    log_section "Phase 2/6: Disk Image Backup"
+
+    if [[ "$(state_get PHASE_BACKUP)" == "complete" ]]; then
+        log_ok "Backup already completed — skipping."; return 0
+    fi
+
+    if [[ "$SKIP_BACKUP" == true ]]; then
+        log_warn "--skip-backup: proceeding without backup."
+        confirm "Confirm: proceed WITHOUT backup?" || die "Migration aborted — backup required."
+        state_set "PHASE_BACKUP" "skipped"; return 0
+    fi
+
+    if [[ -z "$BACKUP_DEV" ]]; then
+        echo
+        echo -e "  ${YELLOW}No backup device specified.${RESET}"
+        echo -e "  Enter block device path (e.g. /dev/sdb), or 's' to skip:"
+        echo -en "  ${YELLOW}Device: ${RESET}"
+        local inp; read -r inp
+        if [[ "$inp" == "s" ]]; then
+            confirm "Skip backup — you accept all risk?" || die "Aborted."
+            state_set "PHASE_BACKUP" "skipped"; return 0
+        fi
+        BACKUP_DEV="$inp"; state_set "BACKUP_DEV" "$BACKUP_DEV"
+    fi
+
+    [[ -b "$BACKUP_DEV" ]] || die "Not a block device: $BACKUP_DEV"
+
+    local root_dev source_disk
+    root_dev=$(df / | tail -1 | awk '{print $1}')
+    if echo "$root_dev" | grep -q "mapper"; then
+        source_disk=$(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}' | head -1 | sed 's/[0-9]*$//')
+    else
+        source_disk=$(echo "$root_dev" | sed 's/[0-9]*$//')
+    fi
+
+    local ss ds
+    ss=$(lsblk -bno SIZE "$source_disk" 2>/dev/null | head -1 || echo "0")
+    ds=$(lsblk -bno SIZE "$BACKUP_DEV"  2>/dev/null | head -1 || echo "0")
+
+    log_info "Source: $source_disk ($(numfmt --to=iec "$ss" 2>/dev/null || echo "${ss}B"))"
+    log_info "Target: $BACKUP_DEV ($(numfmt --to=iec "$ds" 2>/dev/null || echo "${ds}B"))"
+    [[ "$ds" -ge "$ss" ]] || die "Backup device is smaller than source disk."
+
+    echo; log_warn "This will OVERWRITE ALL DATA on $BACKUP_DEV."
+    confirm "Proceed with disk backup? (ERASES $BACKUP_DEV)" || die "Backup declined."
+
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    log_info "Starting backup..."
+    local t0; t0=$(date +%s)
+    if command -v pv &>/dev/null; then
+        pv -tpreb "$source_disk" | dd of="$BACKUP_DEV" bs=4M conv=noerror,sync 2>&1
+    else
+        dd if="$source_disk" of="$BACKUP_DEV" bs=4M conv=noerror,sync status=progress 2>&1
+    fi
+    local elapsed=$(( $(date +%s) - t0 ))
+    log_ok "Backup done in ${elapsed}s."
+
+    log_info "Verifying backup integrity (first 512MB)..."
+    local sh dh
+    sh=$(dd if="$source_disk" bs=1M count=512 2>/dev/null | md5sum | awk '{print $1}')
+    dh=$(dd if="$BACKUP_DEV"  bs=1M count=512 2>/dev/null | md5sum | awk '{print $1}')
+    if [[ "$sh" == "$dh" ]]; then
+        log_ok "Backup verified (MD5: $sh)."
+        state_set "PHASE_BACKUP" "complete"
+        state_set "BACKUP_VERIFIED" "true"
+    else
+        die "BACKUP VERIFICATION FAILED. Source: $sh  Backup: $dh  DO NOT PROCEED."
+    fi
+
+    cat > "${LOG_DIR}/backup_metadata_${START_TIME}.txt" <<EOF
+Backup Date : $(date)
+Source      : $source_disk
+Target      : $BACKUP_DEV
+Duration    : ${elapsed}s
+MD5 (512M)  : $sh
+OS          : $(cat /etc/centos-release 2>/dev/null)
+Kernel      : $(uname -r)
+Restore cmd : dd if=$BACKUP_DEV of=$source_disk bs=4M conv=noerror,sync status=progress
+              grub2-install $source_disk && grub2-mkconfig -o /boot/grub2/grub.cfg
+EOF
+    log_ok "Metadata: ${LOG_DIR}/backup_metadata_${START_TIME}.txt"
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3: Prepare system
+# ---------------------------------------------------------------------------
+phase_prepare() {
+    log_section "Phase 3/6: Prepare System"
+
+    if [[ "$(state_get PHASE_PREPARE)" == "complete" ]]; then
+        log_ok "Prepare already completed — skipping."; return 0
+    fi
+
+    confirm "Begin system preparation? (yum update, cleanup, config backup)" || die "Aborted."
+
+    # 1: yum update
+    log_info "1/7: Updating all packages to latest CentOS 7 versions..."
+    yum update -y 2>&1 | tail -20 || log_warn "yum update had non-zero exit — continuing."
+    log_ok "System updated."
+
+    # 2: clean cache
+    log_info "2/7: Cleaning yum cache..."
+    yum clean all 2>/dev/null || true
+    rm -rf /var/cache/yum/* 2>/dev/null || true
+    log_ok "Cache cleaned."
+
+    # 3: conflicting packages
+    log_info "3/7: Removing packages known to conflict with ELevate..."
+    local conflict=(
+        centos-release-scl centos-release-scl-rh
+        python2-virtualenv python-virtualenv
+        abrt abrt-addon-ccpp abrt-addon-kerneloops abrt-addon-pstoreoops
+        abrt-addon-python abrt-addon-vmcore abrt-addon-xorg abrt-cli
+        abrt-console-notification abrt-libs abrt-plugin-sosreport
+    )
+    for pkg in "${conflict[@]}"; do
+        if rpm -q "$pkg" &>/dev/null 2>&1; then
+            log_info "  Removing: $pkg"
+            yum remove -y "$pkg" \
+                --setopt=clean_requirements_on_remove=0 2>/dev/null || \
+                log_warn "  Could not remove $pkg — continuing."
+        fi
+    done
+    log_ok "Conflicting packages removed."
+
+    # 4: old kernels
+    log_info "4/7: Removing old kernels..."
+    package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
+    log_ok "Old kernels removed."
+
+    # 5: EPEL
+    if ! rpm -q epel-release &>/dev/null 2>&1; then
+        log_info "5/7: Installing EPEL..."
+        yum install -y epel-release 2>/dev/null && log_ok "EPEL installed." || \
+            log_warn "EPEL install failed — continuing."
+    else
+        log_ok "5/7: EPEL already present."
+    fi
+
+    # 6: disable third-party repos
+    log_info "6/7: Temporarily disabling third-party repos..."
+    find /etc/yum.repos.d/ -name "*.repo" \
+        ! -name "CentOS-*.repo" ! -name "epel*.repo" \
+        -exec bash -c 'sed -i "s/^enabled=1/enabled=0/" "$1"' _ {} \; 2>/dev/null || true
+    log_ok "Third-party repos disabled (re-enable post-upgrade)."
+
+    # 7: snapshot + config backup
+    log_info "7/7: Saving package snapshot and config backups..."
+    rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort \
+        > "${LOG_DIR}/packages_before_${START_TIME}.txt"
+    local cbd="${LOG_DIR}/config_backup_${START_TIME}"
+    mkdir -p "$cbd"
+    for d in /etc/httpd /etc/nginx /etc/mysql /etc/my.cnf.d /etc/php.ini \
+              /etc/php.d /etc/postfix /etc/dovecot /etc/ssh /etc/cron.d \
+              /etc/sysconfig/network-scripts /etc/NetworkManager; do
+        [[ -e "$d" ]] && cp -a "$d" "$cbd/" 2>/dev/null && log_info "  Backed up: $d"
+    done
+    log_ok "Snapshots and configs saved: $cbd"
+
+    state_set "PHASE_PREPARE" "complete"
+    log_ok "System preparation complete."
+}
+
+# ---------------------------------------------------------------------------
+# leapp binary resolver (6-stage, with install fallback)
+# ---------------------------------------------------------------------------
+resolve_leapp_bin() {
+    # Stage 1: known paths
+    for p in /usr/bin/leapp /bin/leapp /usr/local/bin/leapp; do
+        [[ -x "$p" ]] && { LEAPP_BIN="$p"; log_ok "leapp: $LEAPP_BIN"; return 0; }
+    done
+    # Stage 2: PATH
+    if command -v leapp &>/dev/null 2>&1; then
+        LEAPP_BIN="$(command -v leapp)"; log_ok "leapp (PATH): $LEAPP_BIN"; return 0
+    fi
+    # Stage 3: filesystem search
+    local f
+    f=$(find / -name "leapp" -type f -executable 2>/dev/null | grep -v proc | grep -v sys | head -1 || true)
+    [[ -n "$f" ]] && { LEAPP_BIN="$f"; log_ok "leapp (search): $LEAPP_BIN"; return 0; }
+    # Stage 4: RPM file lists
+    local rb
+    for pkg in leapp python2-leapp leapp-upgrade-el7toel8; do
+        rb=$(rpm -ql "$pkg" 2>/dev/null | grep -E "bin/leapp$" | head -1 || true)
+        [[ -n "$rb" && -x "$rb" ]] && { LEAPP_BIN="$rb"; log_ok "leapp (RPM list): $LEAPP_BIN"; return 0; }
+    done
+    # Stage 5: install providers
+    log_warn "leapp binary not found — attempting to install provider packages..."
+    yum-config-manager --enable elevate &>/dev/null 2>&1 || true
+    for pkg in leapp python2-leapp leapp-framework; do
+        log_info "  Trying: yum install -y $pkg"
+        yum install -y "$pkg" 2>&1 | tail -5 || true
+        for p in /usr/bin/leapp /bin/leapp; do
+            [[ -x "$p" ]] && { LEAPP_BIN="$p"; log_ok "leapp after install: $LEAPP_BIN"; return 0; }
+        done
+        command -v leapp &>/dev/null 2>&1 && { LEAPP_BIN="$(command -v leapp)"; return 0; }
+    done
+    # Stage 6: diagnostic and die
+    log_error "══════════════════════════════════════════════════"
+    log_error "FATAL: leapp binary not found. Diagnostic dump:"
+    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" | while read -r p; do log_error "  pkg: $p"; done
+    yum repolist all 2>/dev/null | grep -i elevate | while read -r l; do log_error "  repo: $l"; done
+    for pkg in leapp python2-leapp leapp-upgrade-el7toel8; do
+        rpm -q "$pkg" &>/dev/null 2>&1 && \
+            rpm -ql "$pkg" 2>/dev/null | while read -r fl; do log_error "  [$pkg] $fl"; done
+    done
+    log_error "Manual fix: yum-config-manager --enable elevate && yum install -y leapp"
+    log_error "══════════════════════════════════════════════════"
+    die "Cannot proceed without leapp binary."
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4: Install ELevate
+# ---------------------------------------------------------------------------
+phase_install_elevate() {
+    log_section "Phase 4/6: Install ELevate"
+
+    if [[ "$(state_get PHASE_ELEVATE)" == "complete" ]]; then
+        log_ok "ELevate already installed — re-resolving binary..."
+        resolve_leapp_bin; return 0
+    fi
+
+    local elevate_url="https://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm"
+
+    # Install elevate-release
+    if rpm -q elevate-release &>/dev/null 2>&1; then
+        log_ok "elevate-release already installed."
+    else
+        log_info "Installing ELevate release package..."
+        yum install -y "$elevate_url" 2>&1 | tail -10 || true
+        rpm -q elevate-release &>/dev/null 2>&1 || die "elevate-release failed to install."
+        log_ok "elevate-release installed."
+    fi
+
+    # Force-enable elevate repo (disabled by default after install)
+    log_info "Enabling ELevate repo..."
+    yum-config-manager --enable elevate &>/dev/null 2>&1 || \
+        sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
+    yum clean all &>/dev/null
+    log_ok "ELevate repo enabled."
+
+    # Install all leapp packages in one transaction
+    log_info "Installing leapp packages (all in one transaction)..."
+    case "$TARGET_DISTRO" in
+        alma)
+            yum install -y \
+                leapp python2-leapp leapp-upgrade leapp-data-almalinux \
+                2>&1 | tail -30 || true
+            rpm -q leapp-data-almalinux &>/dev/null 2>&1 || die "leapp-data-almalinux failed to install."
+            ;;
+        rocky)
+            yum install -y \
+                leapp python2-leapp leapp-upgrade leapp-data-rocky \
+                2>&1 | tail -30 || true
+            rpm -q leapp-data-rocky &>/dev/null 2>&1 || die "leapp-data-rocky failed to install."
+            ;;
+    esac
+
+    log_info "Installed leapp packages:"
+    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" | while read -r p; do log_info "  $p"; done
+
+    resolve_leapp_bin
+    state_set "PHASE_ELEVATE" "complete"
+    log_ok "ELevate installed."
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4b: Fix leapp inhibitors (universal, idempotent)
+# ---------------------------------------------------------------------------
 _blacklist_driver() {
     local drv="$1"
-    local blacklist_file="/etc/modprobe.d/${drv}.conf"
-    if [[ ! -f "$blacklist_file" ]]; then
-        echo "blacklist ${drv}" > "$blacklist_file"
-        log_ok "  Blacklisted driver: ${drv}"
-    fi
-    if lsmod 2>/dev/null | grep -q "^${drv} "; then
-        rmmod "$drv" 2>/dev/null &&             log_ok "  Unloaded module: ${drv}" ||             log_warn "  Could not unload ${drv} — will take effect after reboot."
-    fi
+    local bf="/etc/modprobe.d/${drv}.conf"
+    [[ -f "$bf" ]] || { echo "blacklist ${drv}" > "$bf"; log_ok "  Blacklisted: $drv"; }
+    lsmod 2>/dev/null | grep -q "^${drv} " && \
+        rmmod "$drv" 2>/dev/null && log_ok "  Unloaded: $drv" || true
 }
 
-apply_leapp_answers() {
-    log_section "Applying leapp answers for common prompts"
+phase_fix_inhibitors() {
+    log_section "Phase 4b: Universal Inhibitor Remediation"
 
-    # Answer common leapp questions automatically
-    local answers_file="/var/log/leapp/answerfile"
-    if [[ -f "$answers_file" ]]; then
-        log_info "Existing leapp answerfile found:"
-        cat "$answers_file"
-    fi
+    # Step 1: leapp answerfile — pre-answer all known interactive prompts
+    log_info "Step 1: Pre-answering all known leapp interactive prompts..."
+    for ans in \
+        "remove_pam_pkcs11_module_check.confirm=True" \
+        "authselect_check.confirm=True" \
+        "remove_ifcfg_files_check.confirm=True" \
+        "grub_enableos_prober_check.confirm=True" \
+        "verify_check_results.confirm=True"
+    do
+        "$LEAPP_BIN" answer --section "$ans" 2>/dev/null && log_ok "  Answered: $ans" || true
+    done
 
-    $LEAPP_BIN answer --section remove_pam_pkcs11_module_check.confirm=True 2>/dev/null || true
-    $LEAPP_BIN answer --section authselect_check.confirm=True 2>/dev/null || true
-
-    log_ok "leapp answers configured."
-}
-
-run_upgrade() {
-    log_section "Executing ELevate In-Place Upgrade"
-
-    log_warn "POINT OF NO EASY RETURN — upgrade will begin."
-    log_warn "Ensure backup is verified and all inhibitors are resolved."
-    echo
-
-    if ! confirm "START UPGRADE NOW? (System will reboot automatically)"; then
-        die "Upgrade cancelled by user."
-    fi
-
-    log_info "Starting leapp upgrade..."
-    log_info "The system will reboot into a special upgrade initramfs environment."
-    log_info "Do NOT interrupt power during this process."
-    echo
-
-    # leapp upgrade initiates the process and reboots
-    $LEAPP_BIN upgrade 2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log"
-
-    log_info "leapp upgrade initiated. System will reboot automatically."
-    log_info "After reboot, the upgrade will continue in the initramfs environment."
-    log_info "This may take 20-60 minutes. Monitor via console."
-    echo
-    log_info "After the system comes back online, run this script with --post-upgrade to validate."
-}
-
-# ---------------------------------------------------------------------------
-# SECTION 5: POST-UPGRADE VALIDATION
-# ---------------------------------------------------------------------------
-post_upgrade_validate() {
-    log_section "Post-Upgrade Validation"
-
-    echo "--- New OS Version ---"
-    cat /etc/os-release
-    echo
-
-    echo "--- New Kernel ---"
-    uname -a
-    echo
-
-    # Verify target distro
-    if [[ -f /etc/almalinux-release ]]; then
-        log_ok "AlmaLinux 8 confirmed: $(cat /etc/almalinux-release)"
-    elif [[ -f /etc/rocky-release ]]; then
-        log_ok "Rocky Linux 8 confirmed: $(cat /etc/rocky-release)"
-    elif [[ -f /etc/redhat-release ]]; then
-        local rh_ver
-        rh_ver=$(cat /etc/redhat-release)
-        if echo "$rh_ver" | grep -q " 8"; then
-            log_ok "EL8 OS detected: $rh_ver"
-        else
-            log_error "Unexpected OS version: $rh_ver"
-        fi
+    # Step 2: Generate leapp report if missing
+    if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
+        log_info "Step 2: Generating initial leapp report..."
+        "$LEAPP_BIN" preupgrade 2>/dev/null || true
     else
-        log_error "Cannot determine OS release!"
+        log_ok "Step 2: leapp report already exists."
     fi
 
-    echo
-    echo "--- DNF / Package Manager ---"
-    dnf --version
-    echo
+    # Step 3: Dynamically blacklist drivers from report
+    log_info "Step 3: Blacklisting removed drivers from leapp report..."
+    if [[ -f /var/log/leapp/leapp-report.txt ]]; then
+        local rdrvs=()
+        while IFS= read -r line; do
+            if echo "$line" | grep -qE "^\s+- [a-z0-9_]+$"; then
+                local d; d=$(echo "$line" | tr -d ' -')
+                [[ "$d" =~ ^[a-z0-9_]+$ ]] && [[ ${#d} -lt 40 ]] && rdrvs+=("$d")
+            fi
+        done < <(grep -A 20 "kernel drivers" /var/log/leapp/leapp-report.txt 2>/dev/null || true)
+        for d in "${rdrvs[@]}"; do _blacklist_driver "$d"; done
+    fi
 
-    # Check critical services
-    log_section "Service Health Check"
-    local services_to_check=(sshd NetworkManager rsyslog crond)
-    for svc in "${services_to_check[@]}"; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            log_ok "$svc is running."
-        else
-            log_warn "$svc is NOT running. Check with: systemctl status $svc"
+    # Step 4: Universally removed drivers (EL7→EL8 and EL8→EL9)
+    log_info "Step 4: Blacklisting universally removed drivers..."
+    local udrvs=(
+        pata_acpi floppy isdn nozomi aoe
+        snd_emu10k1_synth acerhdf asus_acpi bcm203x bpa10x
+        lirc_serial mptbase mptctl mptfc mptlan mptsas mptscsih mptspi
+        mtdblock n_hdlc pch_gbe snd_atiixp_modem snd_via82xx_modem
+        ueagle_atm usbatm xusbatm
+    )
+    for d in "${udrvs[@]}"; do
+        if lsmod 2>/dev/null | grep -q "^${d} " || \
+           grep -q "$d" /var/log/leapp/leapp-report.txt 2>/dev/null; then
+            _blacklist_driver "$d"
         fi
     done
 
-    # Check for failed units
-    echo
-    echo "--- Failed Systemd Units ---"
-    systemctl --failed 2>/dev/null
-    echo
-
-    # Network check
-    log_section "Network Validation"
-    if ping -c2 -W3 8.8.8.8 &>/dev/null; then
-        log_ok "Network connectivity OK (ping 8.8.8.8)."
-    else
-        log_warn "Cannot reach 8.8.8.8 — check network configuration."
+    # Step 5: VDO
+    if systemctl is-active --quiet vdo 2>/dev/null; then
+        log_warn "VDO detected — stopping before upgrade..."
+        systemctl stop vdo 2>/dev/null || true
+        systemctl disable vdo 2>/dev/null || true
+        log_ok "VDO stopped."
     fi
 
-    if ping -c2 -W3 google.com &>/dev/null; then
-        log_ok "DNS resolution OK."
-    else
-        log_warn "DNS resolution may be broken. Check /etc/resolv.conf"
+    # Step 6: Legacy eth0 naming
+    if ip link show 2>/dev/null | grep -q "^[0-9]*: eth[0-9]"; then
+        log_warn "Legacy eth0 name — adding net.ifnames=0 biosdevname=0 kernel args..."
+        grubby --update-kernel=ALL --args="net.ifnames=0 biosdevname=0" 2>/dev/null || true
     fi
 
-    # Package count comparison
-    log_section "Package Delta Analysis"
-    rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort \
-        > "${LOG_DIR}/packages_after_${START_TIME}.txt"
+    # Step 7: Postfix compatibility
+    command -v postconf &>/dev/null 2>&1 && \
+        postconf -e compatibility_level=2 2>/dev/null && log_ok "Postfix compatibility_level=2." || true
 
-    if [[ -f "${LOG_DIR}/packages_before_${START_TIME}.txt" ]]; then
-        echo "--- Packages removed during upgrade ---"
-        diff "${LOG_DIR}/packages_before_${START_TIME}.txt" \
-             "${LOG_DIR}/packages_after_${START_TIME}.txt" | grep "^<" | head -40
+    # Step 8: ABRT — safe removal, no cascade
+    local abrt; abrt=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
+    if [[ -n "$abrt" ]]; then
+        log_info "Removing ABRT packages (safe, no autoremove)..."
+        echo "$abrt" | xargs yum remove -y \
+            --setopt=clean_requirements_on_remove=0 2>/dev/null || true
+        log_ok "ABRT removed."
+    fi
+
+    # Safety: reinstall leapp if ABRT removal cascade-removed it
+    if ! rpm -q leapp-upgrade &>/dev/null 2>&1 && \
+       ! rpm -q leapp-upgrade-el7toel8 &>/dev/null 2>&1; then
+        log_warn "leapp-upgrade missing (cascade-removed) — reinstalling..."
+        yum-config-manager --enable elevate &>/dev/null 2>&1 || true
+        case "$TARGET_DISTRO" in
+            alma) yum install -y leapp leapp-upgrade leapp-data-almalinux 2>&1 | tail -10 || true ;;
+            rocky) yum install -y leapp leapp-upgrade leapp-data-rocky 2>&1 | tail -10 || true ;;
+        esac
+        resolve_leapp_bin
+        log_ok "leapp restored."
+    fi
+
+    # Step 9: /etc/redhat-release symlink
+    [[ ! -f /etc/redhat-release ]] && [[ -f /etc/centos-release ]] && \
+        ln -sf /etc/centos-release /etc/redhat-release 2>/dev/null && log_ok "redhat-release symlink fixed." || true
+
+    # Step 10: leapp directories
+    mkdir -p /var/log/leapp /etc/leapp/files 2>/dev/null || true
+
+    # Step 11: IPv6 — disable if broken (leapp nspawn inherits host network)
+    local ipv6off; ipv6off=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "1")
+    if [[ "$ipv6off" == "0" ]] && ! ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
+        log_warn "Broken IPv6 detected — disabling to prevent leapp nspawn repo failures..."
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
+        sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
+        grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null || \
+            printf '\n# el8-migration\nnet.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\n' >> /etc/sysctl.conf
+        log_ok "IPv6 disabled."
+    fi
+
+    state_set "PHASE_INHIBITORS" "complete"
+    log_ok "Inhibitor remediation complete."
+}
+
+# ---------------------------------------------------------------------------
+# Phase 5: leapp preupgrade (with auto-retry)
+# ---------------------------------------------------------------------------
+phase_preupgrade() {
+    log_section "Phase 5/6: leapp preupgrade (DRY RUN)"
+
+    if [[ "$(state_get PHASE_PREUPGRADE)" == "complete" ]]; then
+        log_ok "preupgrade already passed — skipping."; return 0
+    fi
+
+    log_info "This is a DRY RUN — no changes are made to the system."
+
+    local max_attempts=3
+    local attempt=0
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        ((attempt++)) || true
+        log_info "leapp preupgrade — attempt $attempt/$max_attempts..."
+
+        local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
+        "$LEAPP_BIN" preupgrade 2>&1 | tee "$plog" || true
+
+        if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
+            log_error "leapp report not generated. See: $plog"
+            die "leapp preupgrade failed to produce a report."
+        fi
+
+        cp /var/log/leapp/leapp-report.txt "${LOG_DIR}/leapp_report_${START_TIME}_attempt${attempt}.txt"
+
+        # Count hard blockers
+        local inhibitor_count error_count
+        inhibitor_count=$(grep -c "^Risk Factor: high (error)" /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
+        error_count=$(grep -c "Following errors occurred" /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
+
+        if [[ "$inhibitor_count" -eq 0 ]] && [[ "$error_count" -eq 0 ]]; then
+            log_ok "leapp preupgrade: CLEAR — 0 inhibitors, 0 errors."
+            state_set "PHASE_PREUPGRADE" "complete"
+            return 0
+        fi
+
+        # Show report
         echo
-        echo "--- New packages added during upgrade ---"
-        diff "${LOG_DIR}/packages_before_${START_TIME}.txt" \
-             "${LOG_DIR}/packages_after_${START_TIME}.txt" | grep "^>" | head -40
+        log_warn "Inhibitors/errors found (inhibitors: $inhibitor_count, errors: $error_count)"
+        echo -e "\n${YELLOW}══════════ leapp report ══════════${RESET}"
+        cat /var/log/leapp/leapp-report.txt
+        echo -e "${YELLOW}══════════════════════════════════${RESET}\n"
+
+        if [[ $attempt -lt $max_attempts ]]; then
+            log_info "Running auto-remediation (attempt $attempt)..."
+            state_set "PHASE_INHIBITORS" ""   # reset so fix runs again
+            phase_fix_inhibitors
+        else
+            echo
+            log_error "═══════════════════════════════════════════════════════════"
+            log_error "MANUAL ACTION REQUIRED:"
+            log_error "Inhibitors remain after $max_attempts auto-remediation attempts."
+            log_error ""
+            log_error "1. Review report: cat /var/log/leapp/leapp-report.txt"
+            log_error "2. Fix each INHIBITOR listed above manually"
+            log_error "3. Re-run: sudo $SCRIPT_NAME --migrate"
+            log_error "   (Migration will resume from this phase)"
+            log_error "═══════════════════════════════════════════════════════════"
+            die "leapp preupgrade blocked. See report above."
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Phase 6: leapp upgrade — POINT OF NO RETURN
+# ---------------------------------------------------------------------------
+phase_upgrade() {
+    log_section "Phase 6/6: leapp upgrade — POINT OF NO RETURN"
+
+    echo
+    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${RED}${BOLD}║  ⚠  FINAL WARNING — THIS CANNOT BE UNDONE               ║${RESET}"
+    echo -e "${RED}${BOLD}║                                                          ║${RESET}"
+    printf  "${RED}${BOLD}║  Target  : %-47s║${RESET}\n" "${TARGET_DISTRO^^} Linux 8"
+    echo -e "${RED}${BOLD}║  Action  : In-place OS upgrade + automatic reboot        ║${RESET}"
+    echo -e "${RED}${BOLD}║  Recovery: Only via backup restore if something fails    ║${RESET}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
+    echo
+
+    confirm "FINAL CONFIRMATION: Upgrade to ${TARGET_DISTRO^^} Linux 8 and reboot?" || \
+        die "Upgrade cancelled at final confirmation."
+
+    # Final answers
+    "$LEAPP_BIN" answer --section remove_pam_pkcs11_module_check.confirm=True 2>/dev/null || true
+    "$LEAPP_BIN" answer --section authselect_check.confirm=True 2>/dev/null || true
+
+    state_set "PHASE_UPGRADE" "started"
+    log_info "Running leapp upgrade — system will reboot automatically..."
+    echo
+
+    "$LEAPP_BIN" upgrade 2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log" || true
+
+    # Should not reach here normally
+    log_info "leapp upgrade exited. Waiting for reboot..."
+    log_info "If no reboot in 2 minutes, run: reboot"
+    log_info "After reboot: sudo $SCRIPT_NAME --post-upgrade"
+}
+
+# ===========================================================================
+#  SECTION 4 — POST-UPGRADE VALIDATION
+# ===========================================================================
+
+run_post_upgrade() {
+    log_section "POST-UPGRADE VALIDATION"
+
+    echo "--- OS Release ---"
+    cat /etc/os-release 2>/dev/null || echo "(not found)"
+    echo
+
+    echo "--- Kernel ---"
+    uname -a; echo
+
+    # Confirm target distro
+    if [[ -f /etc/almalinux-release ]]; then
+        log_ok "AlmaLinux confirmed: $(cat /etc/almalinux-release)"
+    elif [[ -f /etc/rocky-release ]]; then
+        log_ok "Rocky Linux confirmed: $(cat /etc/rocky-release)"
+    elif grep -q " 8" /etc/redhat-release 2>/dev/null; then
+        log_ok "EL8 confirmed: $(cat /etc/redhat-release)"
+    else
+        log_error "Cannot confirm EL8. Check /etc/os-release manually."
     fi
 
-    # Check for .rpmsave/.rpmnew config files
-    log_section "Configuration File Conflicts"
-    echo "--- .rpmsave files (old configs backed up by RPM) ---"
-    find /etc -name "*.rpmsave" 2>/dev/null | head -30
+    # Package manager
+    echo "--- dnf version ---"
+    dnf --version 2>/dev/null || log_error "dnf not available!"
     echo
-    echo "--- .rpmnew files (new default configs) ---"
-    find /etc -name "*.rpmnew" 2>/dev/null | head -30
+
+    # Services
+    log_section "Service Health"
+    for s in sshd NetworkManager rsyslog crond; do
+        if systemctl is-active --quiet "$s" 2>/dev/null; then
+            log_ok "$s: running"
+        else
+            log_warn "$s: NOT running — check: systemctl status $s"
+        fi
+    done
     echo
-    log_warn "Review and merge .rpmsave and .rpmnew files — these represent config conflicts."
+    echo "--- Failed systemd units ---"
+    systemctl --failed 2>/dev/null || true
+    echo
 
-    # Check for leapp residual files
-    if [[ -d /var/log/leapp ]]; then
-        echo "--- leapp upgrade log summary ---"
-        tail -30 /var/log/leapp/leapp-upgrade.log 2>/dev/null || true
-    fi
+    # Network
+    log_section "Network"
+    ping -c2 -W3 8.8.8.8 &>/dev/null && log_ok "IPv4 connectivity OK." || log_warn "No IPv4 to 8.8.8.8."
+    ping -c2 -W3 google.com &>/dev/null && log_ok "DNS OK." || log_warn "DNS may be broken."
 
-    # Re-enable third-party repos where EL8 versions exist
-    log_section "Repository Re-configuration"
-    log_warn "Review and manually re-enable third-party repos with EL8-compatible versions."
-    log_info "Run: dnf repolist all"
-
-    # EPEL for EL8
+    # EPEL
     if ! rpm -q epel-release &>/dev/null 2>&1; then
         log_info "Installing EPEL for EL8..."
-        dnf install -y epel-release 2>/dev/null && log_ok "EPEL EL8 installed." || true
+        if [[ -f /etc/rocky-release ]]; then
+            dnf config-manager --enable crb 2>/dev/null || \
+            dnf config-manager --set-enabled powertools 2>/dev/null || true
+        fi
+        dnf install -y epel-release 2>/dev/null && log_ok "EPEL installed." || log_warn "EPEL install failed."
+    else
+        log_ok "EPEL present."
     fi
 
-    # Security hardening reminders
-    log_section "Post-Upgrade Security Checklist"
-    log_warn "1. Review /etc/ssh/sshd_config — new defaults in EL8."
-    log_warn "2. EL8 uses crypto-policies — run: update-crypto-policies --show"
-    log_warn "3. SELinux relabelling may be needed: touch /.autorelabel && reboot"
-    log_warn "4. Review firewalld rules: firewall-cmd --list-all"
-    log_warn "5. Check authselect config: authselect list"
-    log_warn "6. Run: dnf update --security to apply any post-upgrade security patches."
+    # Config conflicts
+    log_section "Configuration Conflicts"
+    echo "--- .rpmsave (old config backed up by RPM) ---"
+    find /etc -name "*.rpmsave" 2>/dev/null | head -20
+    echo
+    echo "--- .rpmnew (new default config from RPM) ---"
+    find /etc -name "*.rpmnew" 2>/dev/null | head -20
+    echo
+    log_warn "Review and merge .rpmsave / .rpmnew files — these indicate config changes from upgraded packages."
+
+    # Package delta
+    log_section "Package Delta"
+    rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort \
+        > "${LOG_DIR}/packages_after_${START_TIME}.txt"
+    local bf; bf=$(ls -t "${LOG_DIR}"/packages_before_*.txt 2>/dev/null | head -1 || echo "")
+    if [[ -n "$bf" ]]; then
+        echo "Packages removed during upgrade:"
+        diff "$bf" "${LOG_DIR}/packages_after_${START_TIME}.txt" 2>/dev/null | grep "^<" | head -20
+        echo
+        echo "Packages added during upgrade:"
+        diff "$bf" "${LOG_DIR}/packages_after_${START_TIME}.txt" 2>/dev/null | grep "^>" | head -20
+    fi
+
+    # Checklist
+    log_section "Post-Upgrade Action Checklist"
+    echo
+    echo -e "  ${CYAN}1.${RESET} Set Python 3 as default:"
+    echo -e "       alternatives --set python /usr/bin/python3"
+    echo
+    echo -e "  ${CYAN}2.${RESET} Re-enable SELinux enforcing:"
+    echo -e "       sed -i 's/SELINUX=permissive/SELINUX=enforcing/' /etc/selinux/config"
+    echo -e "       touch /.autorelabel && reboot"
+    echo
+    echo -e "  ${CYAN}3.${RESET} Apply security patches:"
+    echo -e "       dnf update --security -y"
+    echo
+    echo -e "  ${CYAN}4.${RESET} Review crypto policies:"
+    echo -e "       update-crypto-policies --show"
+    echo
+    echo -e "  ${CYAN}5.${RESET} Diff SSH config changes:"
+    echo -e "       diff /etc/ssh/sshd_config /etc/ssh/sshd_config.rpmsave 2>/dev/null"
+    echo
+    if [[ -f /etc/rocky-release ]]; then
+        echo -e "  ${CYAN}6.${RESET} Rocky: Enable CRB repo:"
+        echo -e "       dnf config-manager --enable crb"
+        echo
+    fi
+    echo -e "  ${CYAN}7.${RESET} Re-enable third-party repos with EL8-compatible versions:"
+    echo -e "       Review each file in /etc/yum.repos.d/ and update URLs"
+    echo
+    echo -e "  ${CYAN}8.${RESET} Future EL8 → EL9 upgrade when ready:"
+    echo -e "       dnf update -y"
+    echo -e "       dnf install -y https://repo.almalinux.org/elevate/elevate-release-latest-el8.noarch.rpm"
+    echo -e "       dnf install -y leapp-upgrade leapp-data-almalinux  # or leapp-data-rocky"
+    echo -e "       leapp preupgrade && leapp upgrade"
+    echo
 
     log_ok "Post-upgrade validation complete."
 }
 
-# ---------------------------------------------------------------------------
-# SECTION 6: FUTURE UPGRADE PATH ANALYSIS (EL8 → EL9)
-# ---------------------------------------------------------------------------
-analyze_future_upgrade_path() {
-    log_section "Future Upgrade Path: EL8 → EL9 (AlmaLinux/Rocky 9)"
+# ===========================================================================
+#  SECTION 5 — MIGRATION WIZARD
+# ===========================================================================
 
-    cat <<'EOF'
+do_migrate() {
+    log_section "MIGRATION WIZARD"
 
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │         FUTURE UPGRADE PATH ANALYSIS: EL8 → EL9                   │
-  └─────────────────────────────────────────────────────────────────────┘
+    # Run preflight first — always
+    log_info "Running preflight assessment..."
+    run_preflight
+    print_preflight_report
 
-  EL8 (AlmaLinux 8 / Rocky Linux 8) → EL9 (AlmaLinux 9 / Rocky Linux 9)
-  is supported via the same ELevate tooling.
-
-  TIMELINE:
-    AlmaLinux 8  → EOL: 2029-03-01
-    Rocky Linux 8→ EOL: 2029-05-31
-    AlmaLinux 9  → EOL: 2032-05-31
-    Rocky Linux 9→ EOL: 2032-05-31
-
-  WHEN READY TO UPGRADE TO EL9:
-    1. Ensure all packages are fully updated on EL8:
-         dnf update -y
-
-    2. Install ELevate for EL8→EL9:
-         dnf install -y https://repo.almalinux.org/elevate/elevate-release-latest-el8.noarch.rpm
-         dnf install -y leapp-upgrade leapp-data-almalinux   # or leapp-data-rocky
-
-    3. Pre-upgrade check:
-         leapp preupgrade
-
-    4. Review and fix inhibitors in /var/log/leapp/leapp-report.txt
-
-    5. Upgrade:
-         leapp upgrade
-         # System reboots and completes upgrade automatically
-
-  KEY EL8 → EL9 CHANGES TO PLAN FOR:
-    • Minimum TLS version: 1.2 (TLS 1.0/1.1 disabled by default)
-    • OpenSSL 3.0 (breaking changes for some apps using deprecated APIs)
-    • PHP AppStream: 8.0, 8.1, 8.2
-    • Python 3.9 as default (3.6/3.8 via modules)
-    • MySQL 8.0, MariaDB 10.5/10.6/10.11
-    • PostgreSQL 13/14/15/16
-    • Node.js 16, 18, 20 module streams
-    • Kernel 5.14 (RHEL 9 kernel)
-    • nftables replaces iptables (nft backend for firewalld)
-    • SHA-1 signature policy changes (may affect old SSL certs)
-    • XFS default (no ext4 for new installs)
-    • cgroups v2 default
-    • GRUB2 with BLS (Boot Loader Specification) required
-
-  UPGRADE CHAIN SUMMARY:
-    CentOS 7.x
-      └─→ [This script — ELevate] → AlmaLinux 8 / Rocky Linux 8
-               └─→ [ELevate EL8→EL9] → AlmaLinux 9 / Rocky Linux 9
-                         └─→ [Future ELevate] → AlmaLinux 10 / Rocky Linux 10
-
-EOF
-
-    log_ok "Future upgrade path analysis complete."
-}
-
-# ---------------------------------------------------------------------------
-# SECTION 7: GENERATE FINAL REPORT
-# ---------------------------------------------------------------------------
-generate_report() {
-    log_section "Generating Final Migration Report"
-
-    cat > "$REPORT_FILE" <<EOF
-================================================================================
-  CentOS 7 → EL8 Migration Analysis Report
-  Generated: $(date)
-  Hostname : $(hostname -f)
-  Script   : $SCRIPT_NAME v${SCRIPT_VERSION}
-================================================================================
-
-OS INFORMATION
---------------
-$(cat /etc/centos-release 2>/dev/null || cat /etc/os-release)
-Kernel: $(uname -r)
-Arch  : $(uname -m)
-
-RISK SUMMARY
-------------
-  CRITICAL : $RISK_CRITICAL
-  HIGH     : $RISK_HIGH
-  MEDIUM   : $RISK_MEDIUM
-  LOW      : $RISK_LOW
-
-$(if [[ $RISK_CRITICAL -gt 0 ]]; then
-  echo "⛔ CRITICAL ISSUES DETECTED — DO NOT UPGRADE WITHOUT RESOLVING"
-elif [[ $RISK_HIGH -gt 0 ]]; then
-  echo "⚠️  HIGH RISK ISSUES DETECTED — REVIEW CAREFULLY BEFORE UPGRADING"
-elif [[ $RISK_MEDIUM -gt 0 ]]; then
-  echo "⚡ MEDIUM RISK — REVIEW WARNINGS BEFORE UPGRADING"
-else
-  echo "✅ NO CRITICAL OR HIGH RISK ISSUES DETECTED — UPGRADE APPEARS SAFE"
-fi)
-
-HARDWARE
---------
-CPU   : $(lscpu | grep "Model name" | sed 's/Model name: *//')
-Memory: $(free -h | awk '/^Mem:/{print $2}') total
-Virt  : $(systemd-detect-virt 2>/dev/null || echo unknown)
-
-DISK LAYOUT
------------
-$(df -hT)
-
-SERVICES TO VERIFY POST-UPGRADE
----------------------------------
-$(systemctl list-units --type=service --state=active 2>/dev/null | awk '{print $1}' | grep ".service" | head -30)
-
-LOG FILES
----------
-  Full Log      : $LOG_FILE
-  This Report   : $REPORT_FILE
-  leapp report  : /var/log/leapp/leapp-report.txt
-  Config Backup : ${LOG_DIR}/config_backup_${START_TIME}/
-
-NEXT STEPS
-----------
-1. Resolve all CRITICAL and HIGH risk issues above.
-2. Verify backup integrity before proceeding.
-3. Run: leapp preupgrade — review /var/log/leapp/leapp-report.txt
-4. Fix all leapp inhibitors.
-5. Run: leapp upgrade — system will reboot and complete upgrade.
-6. Post-upgrade: run script with --post-upgrade to validate.
-7. Re-enable and test all services.
-8. Update monitoring, backup agents, and management tools for EL8.
-
-RESTORE FROM BACKUP
--------------------
-$(if [[ -n "$BACKUP_DEV" ]]; then
-  echo "  dd if=$BACKUP_DEV of=$(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}' | head -1 | sed 's/[0-9]*$//') bs=4M conv=noerror,sync status=progress"
-else
-  echo "  No backup device specified."
-fi)
-
-================================================================================
-EOF
-
-    log_ok "Report saved → $REPORT_FILE"
-    echo
-    cat "$REPORT_FILE"
-}
-
-# ---------------------------------------------------------------------------
-# INTERACTIVE: TARGET DISTRO SELECTION
-# ---------------------------------------------------------------------------
-select_target_distro() {
-    if [[ -n "$TARGET_DISTRO" ]]; then
-        if [[ "$TARGET_DISTRO" != "alma" && "$TARGET_DISTRO" != "rocky" ]]; then
-            die "Invalid --target '$TARGET_DISTRO'. Use 'alma' or 'rocky'."
-        fi
-        return 0
+    # Hard stop on blockers
+    if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
+        echo
+        log_error "══════════════════════════════════════════════════"
+        log_error "MIGRATION BLOCKED — ${#PREFLIGHT_BLOCKS[@]} blocker(s) must be resolved:"
+        for b in "${PREFLIGHT_BLOCKS[@]}"; do log_error "  ✖ $b"; done
+        log_error "══════════════════════════════════════════════════"
+        die "Resolve the blockers above and re-run."
     fi
 
-    echo
-    echo -e "${BOLD}Select target distribution:${RESET}"
-    echo "  1) AlmaLinux 8  — Community, RHEL-compatible, backed by CloudLinux"
-    echo "  2) Rocky Linux 8 — Community, RHEL-compatible, founded by CentOS co-founder"
-    echo
-    echo -en "${CYAN}Enter choice [1/2]: ${RESET}"
-    read -r choice
-    case "$choice" in
-        1) TARGET_DISTRO="alma"  ;;
-        2) TARGET_DISTRO="rocky" ;;
-        *) die "Invalid choice." ;;
-    esac
-    log_info "Target selected: $TARGET_DISTRO"
+    # Warn on warnings
+    if [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
+        echo
+        log_warn "${#PREFLIGHT_WARNS[@]} warning(s) detected — review above."
+        confirm "Warnings present. Proceed anyway?" || die "Aborted by user."
+    fi
+
+    # Apply auto-fixes before proceeding
+    if [[ ${#PREFLIGHT_AUTOS[@]} -gt 0 ]]; then
+        log_info "Applying ${#PREFLIGHT_AUTOS[@]} auto-fix(es)..."
+        run_autofix
+    fi
+
+    state_set "PHASE_ASSESS" "complete"
+
+    # Run all phases
+    phase_select_target
+    phase_backup
+    phase_prepare
+    phase_install_elevate
+    phase_fix_inhibitors
+    phase_preupgrade
+    phase_upgrade
 }
 
-# ---------------------------------------------------------------------------
-# MAIN ORCHESTRATION
-# ---------------------------------------------------------------------------
-main() {
-    parse_args "$@"
-    init_logging
-    banner
+# ===========================================================================
+#  SECTION 6 — INTERACTIVE MAIN MENU
+# ===========================================================================
 
-    check_root
-    check_centos7
-    check_required_tools
+show_migration_status() {
+    local sf="${LOG_DIR}/.migration_state"
+    [[ -f "$sf" ]] || return
+    echo -e "  ${BOLD}Current migration progress:${RESET}"
+    local fields=(TARGET_DISTRO PHASE_ASSESS PHASE_BACKUP PHASE_PREPARE PHASE_ELEVATE PHASE_PREUPGRADE PHASE_UPGRADE)
+    for f in "${fields[@]}"; do
+        local v; v=$(grep "^${f}=" "$sf" 2>/dev/null | cut -d= -f2- || echo "—")
+        printf "    %-20s %s\n" "$f:" "${v:-—}"
+    done
+    echo
+}
 
-    # -----------------------------------------------------------------------
-    # ANALYSIS PHASE
-    # -----------------------------------------------------------------------
-    log_section "PHASE 1: SYSTEM ANALYSIS"
-    analyze_system
-    analyze_boot
-    analyze_network
-    analyze_repositories
-    analyze_installed_packages
-    analyze_services
-    analyze_security
-    analyze_users
-    analyze_applications_deep
-    check_disk_space_for_upgrade
-    analyze_future_upgrade_path
+main_menu() {
+    while true; do
+        banner
+        show_migration_status
 
-    generate_report
+        echo -e "  ${BOLD}${WHITE}Main Menu${RESET}"
+        echo
+        echo -e "  ${CYAN}1)${RESET} Assess       — Preflight check (read-only, no changes)"
+        echo -e "  ${CYAN}2)${RESET} Fix          — Auto-fix safe issues found by assessment"
+        echo -e "  ${CYAN}3)${RESET} Migrate      — Full migration wizard (phase by phase)"
+        echo -e "  ${CYAN}4)${RESET} Post-upgrade — Validate after upgrade completes"
+        echo -e "  ${CYAN}5)${RESET} View report  — Open last preflight report"
+        echo -e "  ${CYAN}6)${RESET} Reset state  — Clear saved progress (start fresh)"
+        echo -e "  ${CYAN}0)${RESET} Exit"
+        echo
+        echo -en "  ${YELLOW}Choice: ${RESET}"
+        local ch; read -r ch
 
-    # -----------------------------------------------------------------------
-    # ANALYZE ONLY? STOP HERE.
-    # -----------------------------------------------------------------------
-    if [[ "$ANALYZE_ONLY" == true ]]; then
-        log_info "Analysis complete. --analyze-only specified — no changes made."
-        log_info "Full log: $LOG_FILE"
-        log_info "Report:   $REPORT_FILE"
+        case "$ch" in
+            1)
+                init_logging
+                run_preflight
+                print_preflight_report
+                state_set "PHASE_ASSESS" "complete"
+                echo; echo -en "${YELLOW}  Press Enter to return to menu...${RESET}"; read -r
+                ;;
+            2)
+                init_logging
+                if [[ "$(state_get PHASE_ASSESS)" != "complete" ]]; then
+                    log_warn "No assessment found. Running assessment first..."
+                    run_preflight; print_preflight_report; state_set "PHASE_ASSESS" "complete"
+                fi
+                run_autofix
+                echo; echo -en "${YELLOW}  Press Enter...${RESET}"; read -r
+                ;;
+            3)
+                init_logging
+                do_migrate
+                echo; echo -en "${YELLOW}  Press Enter...${RESET}"; read -r 2>/dev/null || true
+                ;;
+            4)
+                init_logging
+                run_post_upgrade
+                echo; echo -en "${YELLOW}  Press Enter...${RESET}"; read -r
+                ;;
+            5)
+                local rpt; rpt=$(ls -t "${LOG_DIR}"/preflight_report_*.txt 2>/dev/null | head -1 || echo "")
+                if [[ -n "$rpt" ]]; then less "$rpt"
+                else echo "  No report found. Run assessment first."; sleep 2; fi
+                ;;
+            6)
+                confirm "Reset all state? (Does NOT undo system changes)" && \
+                    rm -f "${LOG_DIR}/.migration_state" && preflight_reset && log_ok "State reset."
+                sleep 1
+                ;;
+            0) echo; log_info "Exiting."; exit 0 ;;
+            *) echo "  Invalid choice."; sleep 1 ;;
+        esac
+    done
+}
+
+# ===========================================================================
+#  ENTRY POINT
+# ===========================================================================
+
+parse_args "$@"
+state_init
+
+case "$MODE" in
+    "assess")
+        init_logging; banner
+        [[ $EUID -ne 0 ]] && die "Must run as root."
+        run_preflight; print_preflight_report
+        [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]] && exit 2
+        [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]] && exit 1
         exit 0
-    fi
-
-    # -----------------------------------------------------------------------
-    # RISK GATE
-    # -----------------------------------------------------------------------
-    echo
-    log_info "Risk Summary — CRITICAL: $RISK_CRITICAL | HIGH: $RISK_HIGH | MEDIUM: $RISK_MEDIUM | LOW: $RISK_LOW"
-    if [[ $RISK_CRITICAL -gt 0 ]]; then
-        log_error "CRITICAL risks detected. Review the report and resolve before upgrading."
-        if ! confirm "Critical issues found. Do you still want to continue? (NOT RECOMMENDED)"; then
-            die "Upgrade aborted due to critical risks."
-        fi
-    elif [[ $RISK_HIGH -gt 0 ]]; then
-        log_warn "High risk items detected. Review the report."
-        if ! confirm "High risk issues found. Continue with upgrade?"; then
-            die "Upgrade aborted by user."
-        fi
-    fi
-
-    # -----------------------------------------------------------------------
-    # TARGET SELECTION
-    # -----------------------------------------------------------------------
-    select_target_distro
-
-    # -----------------------------------------------------------------------
-    # PHASE 2: BACKUP
-    # -----------------------------------------------------------------------
-    log_section "PHASE 2: BACKUP"
-    if [[ "$SKIP_BACKUP" == true ]]; then
-        log_warn "--skip-backup specified. Proceeding WITHOUT disk image backup."
-        log_warn "Ensure you have an external backup before continuing."
-        if ! confirm "Proceed without backup?"; then
-            die "Upgrade aborted — no backup."
-        fi
-    else
-        backup_to_block_device
-    fi
-
-    # -----------------------------------------------------------------------
-    # PHASE 3: PREPARATION
-    # -----------------------------------------------------------------------
-    log_section "PHASE 3: PRE-UPGRADE PREPARATION"
-    if ! confirm "Begin pre-upgrade preparation (package updates, cleanup)?"; then
-        die "Upgrade aborted by user."
-    fi
-    prepare_system
-
-    # -----------------------------------------------------------------------
-    # PHASE 4: ELEVATE / LEAPP
-    # -----------------------------------------------------------------------
-    log_section "PHASE 4: ELEVATE UPGRADE"
-    install_elevate
-    # Note: resolve_leapp_bin is called inside install_elevate above
-    # LEAPP_BIN is now set and ready
-    fix_leapp_inhibitors
-    run_preupgrade_check
-    apply_leapp_answers
-
-    # -----------------------------------------------------------------------
-    # FINAL CONFIRM & LAUNCH
-    # -----------------------------------------------------------------------
-    echo
-    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════${RESET}"
-    echo -e "${BOLD}${RED}  FINAL CONFIRMATION: UPGRADE WILL BEGIN               ${RESET}"
-    echo -e "${BOLD}${RED}  Target: ${TARGET_DISTRO^^} Linux 8                    ${RESET}"
-    echo -e "${BOLD}${RED}  System will REBOOT automatically during upgrade.     ${RESET}"
-    echo -e "${BOLD}${RED}═══════════════════════════════════════════════════════${RESET}"
-    echo
-
-    if ! confirm "FINAL CONFIRMATION: Proceed with upgrade to ${TARGET_DISTRO^^} Linux 8?"; then
-        die "Upgrade cancelled by user at final confirmation."
-    fi
-
-    run_upgrade
-
-    # If leapp upgrade exits without rebooting (shouldn't normally happen)
-    log_info "After system reboots and upgrade completes, run:"
-    log_info "  $0 --post-upgrade"
-}
-
-# Handle --post-upgrade mode
-if [[ "${1:-}" == "--post-upgrade" ]]; then
-    init_logging
-    banner
-    check_root
-    post_upgrade_validate
-    generate_report
-    exit 0
-fi
-
-main "$@"
+        ;;
+    "fix")
+        init_logging; banner
+        [[ $EUID -ne 0 ]] && die "Must run as root."
+        run_autofix
+        ;;
+    "migrate")
+        init_logging; banner
+        [[ $EUID -ne 0 ]] && die "Must run as root."
+        do_migrate
+        ;;
+    "post-upgrade")
+        init_logging; banner
+        [[ $EUID -ne 0 ]] && die "Must run as root."
+        run_post_upgrade
+        ;;
+    ""|"menu")
+        [[ $EUID -ne 0 ]] && die "Must run as root."
+        init_logging
+        main_menu
+        ;;
+    *)
+        echo "Unknown mode: $MODE"; usage; exit 1 ;;
+esac

@@ -1,79 +1,56 @@
 # Changelog
 
-All notable changes to this project are documented here.
+## [3.0.0] — 2026-03-13
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
-Versioning follows [Semantic Versioning](https://semver.org/).
+### Complete redesign
 
----
+**Architecture**
+- Removed `set -e` / `set -euo pipefail` global scope — script no longer dies on non-zero exit
+- Errors collected into categorised arrays (BLOCK / WARN / AUTO-FIX / INFO / PASS) instead of immediately terminating
+- Phase-based execution with state persistence — failed/interrupted migrations resume from last completed phase
+- Four distinct modes: `assess`, `fix`, `migrate`, `post-upgrade`
+- Interactive main menu with migration progress display
 
-## [Unreleased]
+**Assessment phase (new)**
+- Completely non-destructive read-only preflight check
+- Colour-coded report: ✔ PASS / ℹ INFO / ⚙ AUTO-FIX / ⚠ WARN / ✖ BLOCK
+- GO / NO-GO / PROCEED WITH CAUTION verdict
+- Exit codes: 0=go, 1=warnings, 2=blockers (CI-friendly)
+- Saves report to `/var/log/el8-migration/preflight_report_TIMESTAMP.txt`
 
-### Planned
-- HTML report output
-- Email notification on completion
-- AWS/GCP/Azure cloud instance pre-checks
-- Auto-remediation for common MEDIUM-risk issues
-- Slack/webhook notification support
+**Auto-fix phase (new)**
+- Separate `--fix` mode applies only safe, non-destructive remediations
+- Also runs automatically before migration if auto-fixable issues found
 
----
+**Migration wizard**
+- Runs preflight first — blocks if any BLOCK findings exist
+- Each phase is individually confirmable and resumable
+- State saved to `/var/log/el8-migration/.migration_state`
 
-## [2.0.0] — 2024-12-01
+### Bug fixes carried forward from v2.x
 
-### Added
-- **Full system analysis suite** across 10 categories: OS, boot, network, repos, packages, services, security, users, applications, disk space
-- **Block-device disk image backup** (`dd`) with MD5 integrity verification (first 512 MB)
-- Backup metadata file with timestamped restore instructions
-- **4-tier risk scoring system**: CRITICAL / HIGH / MEDIUM / LOW with per-item counters
-- **Risk gate**: Prompts to abort if CRITICAL issues detected; warns on HIGH
-- Detection for: PHP (version + mod_php vs php-fpm), Python 2, MySQL 5.x, MariaDB, PostgreSQL, Apache, Nginx, Java, Node.js, Docker, Kubernetes, SCL, Ansible/Puppet/Chef/Salt, OpenVPN, WireGuard, LUKS, SSSD/FreeIPA, fail2ban, AIDE, auditd
-- **Software Collections (SCL) detection** with HIGH risk flag (SCL not supported in EL8)
-- **Custom kernel module detection** in `/lib/modules/extra/`
-- **Broken shared library** pre-scan (`ldd` on system binaries)
-- Third-party repo detection with per-repo risk flags (Percona, Remi, IUS, Webtatic, Elastic)
-- UEFI vs BIOS boot detection
-- LVM full analysis (pvs/vgs/lvs)
-- Software RAID (`mdstat`) detection
-- Network bonding/teaming detection
-- SELinux status with upgrade impact note
-- firewalld vs iptables detection
-- Config backup of all critical `/etc/` directories pre-upgrade
-- Package snapshot (before/after delta comparison)
-- **leapp inhibitor detection** — parses `leapp-report.txt` and blocks on inhibitors
-- Automatic leapp answerfile entries for common prompts
-- **Post-upgrade validation mode** (`--post-upgrade`): OS version, kernel, services, network, DNS, package delta, `.rpmsave`/`.rpmnew` detection
-- **Future upgrade path analysis** section: EL8 → EL9 guide with breaking changes and EOL timeline
-- Full timestamped audit log (tee'd to `/var/log/el8-migration/`)
-- Structured migration report saved to disk
-- `--analyze-only` mode (read-only, no changes)
-- `--auto-yes` non-interactive mode for CI/CD pipelines
-- `--log-dir` custom log directory
-- `pv` support for progress bar during backup (falls back to `dd status=progress`)
-- `numfmt` for human-readable disk size display
-
-### Changed
-- Complete rewrite from v1.0.0 — modular function-per-analysis-area architecture
-- Risk reporting now uses named functions: `log_critical`, `log_high`, `log_warn`, `log_low`
-- Backup now includes destination size validation before starting
-
-### Fixed
-- LVM disk detection now correctly strips partition suffixes for multi-PV setups
-- `set -euo pipefail` applied globally for fail-fast safety
+- **IPv6**: Detects broken IPv6 and disables via `sysctl` before leapp runs — prevents `Unable to install RHEL 8 userspace packages` error from leapp nspawn repo failures
+- **ABRT cascade removal**: Uses `--setopt=clean_requirements_on_remove=0` — prevents yum from cascade-removing `leapp-upgrade-el7toel8` via `libreport` dependency
+- **leapp binary resolver**: 6-stage resolver (known paths → PATH → filesystem search → RPM file lists → install provider packages → diagnostic dump)
+- **leapp framework package**: Explicitly installs `leapp` RPM (binary provider) separately from `leapp-upgrade-el7toel8` (actors/data provider)
+- **leapp repo disabled by default**: Always force-enables the elevate repo after installing elevate-release RPM
+- **Rocky Linux EPEL**: Enables CRB repo before EPEL install on Rocky Linux
 
 ---
 
-## [1.0.0] — 2024-06-15
+## [2.0.0] — 2026-03-12
 
-### Added
+- Universal leapp inhibitor remediation engine
+- Dynamic driver blacklisting from leapp-report.txt
+- leapp answerfile pre-population for all known interactive prompts
+- IPv6 detection and disabling (Step 10)
+- ABRT safe removal (no autoremove)
+- leapp binary resolver (initial version)
+- Rocky Linux 8 full support audit
+
+## [1.0.0] — 2026-03-11
+
 - Initial release
-- Basic CentOS 7 detection
-- `yum update` + `leapp upgrade` wrapper
-- Simple disk space check
-- Basic service listing
-- Rudimentary backup via `dd` without verification
-
----
-
-[Unreleased]: https://github.com/YOUR_ORG/centos7-el8-migrate/compare/v2.0.0...HEAD
-[2.0.0]: https://github.com/YOUR_ORG/centos7-el8-migrate/compare/v1.0.0...v2.0.0
-[1.0.0]: https://github.com/YOUR_ORG/centos7-el8-migrate/releases/tag/v1.0.0
+- Phase 1–5 migration flow
+- DD backup with MD5 verification
+- Post-upgrade validation

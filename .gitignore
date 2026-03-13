@@ -1,20 +1,18 @@
-# OS / editor artifacts
+# OS
 .DS_Store
 Thumbs.db
+
+# Editor
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
-.vscode/
-.idea/
 
-# Migration logs (never commit these — may contain system info)
+# Migration logs (never commit real system logs)
 /var/log/el8-migration/
 *.log
-migration_report_*.txt
-backup_metadata_*.txt
-packages_before_*.txt
-packages_after_*.txt
 
-# Temp files
+# Temp
 *.tmp
 *.bak
