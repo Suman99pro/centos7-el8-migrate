@@ -890,11 +890,17 @@ install_elevate() {
 
     log_info "Installing leapp-upgrade and target OS data..."
 
+    # Package name varies by ELevate version:
+    # older: leapp-upgrade  newer: leapp-upgrade-el7toel8
+    leapp_pkg_installed() {
+        rpm -q leapp-upgrade &>/dev/null 2>&1 ||         rpm -q leapp-upgrade-el7toel8 &>/dev/null 2>&1
+    }
+
     case "$TARGET_DISTRO" in
         alma)
             yum install -y leapp-upgrade leapp-data-almalinux 2>&1 | tail -20 || true
-            # Verify the packages actually landed
-            if ! rpm -q leapp-upgrade &>/dev/null 2>&1; then
+            # Verify the packages actually landed (handle both package name variants)
+            if ! leapp_pkg_installed; then
                 die "leapp-upgrade failed to install. Check yum output above."
             fi
             if ! rpm -q leapp-data-almalinux &>/dev/null 2>&1; then
@@ -904,7 +910,7 @@ install_elevate() {
         rocky)
             yum install -y leapp-upgrade leapp-data-rocky 2>&1 | tail -20 || \
             yum install -y leapp-upgrade python2-leapp 2>&1 | tail -20 || true
-            if ! rpm -q leapp-upgrade &>/dev/null 2>&1; then
+            if ! leapp_pkg_installed; then
                 die "leapp-upgrade failed to install. Check yum output above."
             fi
             ;;
