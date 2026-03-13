@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.1.1"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -256,15 +256,17 @@ _pf_network() {
         pf_pass "IPv6: already disabled (safe for leapp)."
     fi
 
-    # Check if a leapp nspawn overlay exists and has a broken resolv.conf
+    # Check if a leapp nspawn overlay exists and has broken network config
     local overlay
     overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
     if [[ -n "$overlay" ]]; then
-        local overlay_resolv="${overlay}/etc/resolv.conf"
-        if [[ ! -s "$overlay_resolv" ]]; then
-            pf_auto "leapp nspawn overlay exists but has empty/missing resolv.conf ($overlay_resolv). Will be fixed — this causes all repo syncs to fail inside the container."
+        local issues=()
+        [[ ! -s "${overlay}/etc/resolv.conf" ]] && issues+=("resolv.conf missing/empty")
+        [[ ! -s "${overlay}/etc/pki/tls/certs/ca-bundle.crt" ]] && issues+=("CA bundle missing/empty")
+        if [[ ${#issues[@]} -gt 0 ]]; then
+            pf_auto "leapp nspawn overlay has network issues: ${issues[*]}. Will be fixed — causes all repo syncs to fail inside the upgrade container."
         else
-            pf_pass "leapp nspawn overlay resolv.conf present."
+            pf_pass "leapp nspawn overlay network config OK."
         fi
     fi
 }
@@ -548,16 +550,20 @@ run_autofix() {
         log_ok "Fixed /etc/redhat-release symlink."
     fi
 
-    # nspawn overlay resolv.conf — fix if overlay already exists from a previous run
+    # nspawn overlay — fix CA bundle + resolv.conf if overlay already exists
     local overlay
     overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
     if [[ -n "$overlay" ]]; then
-        local overlay_resolv="${overlay}/etc/resolv.conf"
-        if [[ ! -s "$overlay_resolv" ]]; then
-            log_info "Fixing leapp nspawn overlay resolv.conf..."
-            mkdir -p "${overlay}/etc" 2>/dev/null || true
-            cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
-            log_ok "nspawn overlay resolv.conf fixed."
+        mkdir -p "${overlay}/etc/pki/tls/certs" "${overlay}/etc" 2>/dev/null || true
+        local needs_fix=false
+        [[ ! -s "${overlay}/etc/pki/tls/certs/ca-bundle.crt" ]] && needs_fix=true
+        [[ ! -s "${overlay}/etc/resolv.conf" ]] && needs_fix=true
+        if [[ "$needs_fix" == true ]]; then
+            log_info "Fixing leapp nspawn overlay (CA bundle + resolv.conf)..."
+            cp -f /etc/pki/tls/certs/ca-bundle.crt \
+                "${overlay}/etc/pki/tls/certs/ca-bundle.crt" 2>/dev/null || true
+            cp -f /etc/resolv.conf "${overlay}/etc/resolv.conf" 2>/dev/null || true
+            log_ok "nspawn overlay network fixed."
         fi
     fi
 
@@ -893,81 +899,124 @@ _blacklist_driver() {
 # /etc/resolv.conf which is often empty/missing → all repo syncs fail even
 # though host networking is fine.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Fix leapp nspawn container network + TLS
+#
+# The nspawn overlay is a minimal EL8 userspace. Two things commonly break:
+#
+# 1. /etc/resolv.conf missing/empty → DNS fails inside container
+# 2. /etc/pki/tls/certs/ca-bundle.crt missing/empty → ALL https:// repo
+#    syncs fail immediately with "Failed to synchronize cache".
+#    This is the most common cause: dnf runs fine but can't verify TLS certs.
+#
+# Both are fixed by copying the host files into the overlay.
+# ---------------------------------------------------------------------------
 fix_nspawn_network() {
-    log_info "Checking leapp nspawn overlay network configuration..."
+    log_info "Checking leapp nspawn overlay (network + TLS)..."
 
-    # Locate the overlay directory leapp creates
+    # Locate the overlay — path varies between leapp versions
     local overlay=""
-    local search_paths=(
-        "/var/lib/leapp/scratch/mounts/root_/system_overlay"
+    for candidate in \
+        "/var/lib/leapp/scratch/mounts/root_/system_overlay" \
         "/var/lib/leapp/scratch/mounts/root_overlay"
-    )
-    # Also search dynamically in case path differs between leapp versions
-    local found
-    found=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
-    [[ -n "$found" ]] && search_paths+=("$found")
-
-    for p in "${search_paths[@]}"; do
-        if [[ -d "$p" ]]; then overlay="$p"; break; fi
+    do
+        [[ -d "$candidate" ]] && { overlay="$candidate"; break; }
     done
+    if [[ -z "$overlay" ]]; then
+        local found
+        found=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" \
+                -type d 2>/dev/null | head -1 || true)
+        [[ -n "$found" ]] && overlay="$found"
+    fi
 
     if [[ -z "$overlay" ]]; then
-        log_info "  nspawn overlay not yet created (normal before first preupgrade run)."
+        log_info "  nspawn overlay not yet created — will be fixed after first preupgrade run."
         return 0
     fi
 
-    log_info "  Found overlay: $overlay"
+    log_info "  Overlay: $overlay"
+    mkdir -p "${overlay}/etc/pki/tls/certs" \
+             "${overlay}/etc/pki/ca-trust" \
+             "${overlay}/etc" 2>/dev/null || true
 
-    # Fix 1: /etc/resolv.conf — copy from host if missing or empty
+    # Fix 1: CA bundle — MOST COMMON CAUSE of "Failed to synchronize cache"
+    # The overlay's dnf uses its own libcurl/TLS stack. Without a CA bundle
+    # every https:// repo fails immediately regardless of network connectivity.
+    local overlay_ca="${overlay}/etc/pki/tls/certs/ca-bundle.crt"
+    local host_ca="/etc/pki/tls/certs/ca-bundle.crt"
+    if [[ ! -s "$overlay_ca" ]]; then
+        if [[ -s "$host_ca" ]]; then
+            cp -f "$host_ca" "$overlay_ca" 2>/dev/null || true
+            log_ok "  CA bundle injected into overlay ($(wc -c < "$overlay_ca") bytes)."
+        else
+            log_warn "  Host CA bundle also missing — trying ca-certificates package..."
+            yum install -y ca-certificates 2>/dev/null || true
+            update-ca-trust extract 2>/dev/null || true
+            [[ -s "$host_ca" ]] && cp -f "$host_ca" "$overlay_ca" 2>/dev/null || true
+        fi
+    else
+        log_ok "  Overlay CA bundle present ($(wc -c < "$overlay_ca") bytes)."
+    fi
+
+    # Copy full ca-trust directory too (some versions of curl look here)
+    [[ -d /etc/pki/ca-trust ]] && \
+        cp -rf /etc/pki/ca-trust/. "${overlay}/etc/pki/ca-trust/" 2>/dev/null || true
+
+    # Fix 2: resolv.conf — DNS inside the container
     local overlay_resolv="${overlay}/etc/resolv.conf"
-    mkdir -p "${overlay}/etc" 2>/dev/null || true
     if [[ ! -s "$overlay_resolv" ]]; then
-        log_warn "  Overlay /etc/resolv.conf is missing or empty — copying from host..."
         cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
-        log_ok "  Overlay resolv.conf fixed: $(cat "$overlay_resolv" | head -3 | tr '\n' ' ')"
+        log_ok "  resolv.conf injected into overlay."
     else
-        log_ok "  Overlay resolv.conf present: $(head -1 "$overlay_resolv")"
+        log_ok "  Overlay resolv.conf present."
     fi
 
-    # Fix 2: /etc/hosts — copy from host if missing or empty
+    # Fix 3: /etc/hosts
     local overlay_hosts="${overlay}/etc/hosts"
-    if [[ ! -s "$overlay_hosts" ]]; then
-        log_warn "  Overlay /etc/hosts is missing or empty — copying from host..."
-        cp -f /etc/hosts "$overlay_hosts" 2>/dev/null || true
-        log_ok "  Overlay /etc/hosts fixed."
-    fi
+    [[ ! -s "$overlay_hosts" ]] && cp -f /etc/hosts "$overlay_hosts" 2>/dev/null || true
 
-    # Fix 3: verify DNS works inside the nspawn container
-    # Use a lightweight test — just resolve one hostname
-    log_info "  Testing DNS inside nspawn container..."
-    local dns_ok=false
+    # Verify: test HTTPS from inside nspawn
+    log_info "  Testing HTTPS from inside nspawn container..."
     if systemd-nspawn --register=no --quiet -D "$overlay" \
-        bash -c "getent hosts repo.almalinux.org" &>/dev/null 2>&1; then
-        dns_ok=true
-        log_ok "  DNS inside nspawn: working."
-    elif systemd-nspawn --register=no --quiet -D "$overlay" \
-        bash -c "curl -4 --silent --max-time 5 --head https://repo.almalinux.org" &>/dev/null 2>&1; then
-        dns_ok=true
-        log_ok "  Network inside nspawn: working (curl test)."
+        curl -4 --silent --max-time 10 --head \
+        "https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/repodata/repomd.xml" \
+        &>/dev/null 2>&1; then
+        log_ok "  HTTPS inside nspawn: working."
     else
-        log_warn "  DNS/network inside nspawn not verified — resolv.conf may still be wrong."
-        log_info "  Host resolv.conf content:"
-        cat /etc/resolv.conf | while read -r l; do log_info "    $l"; done
-        log_info "  Overlay resolv.conf content:"
-        cat "$overlay_resolv" 2>/dev/null | while read -r l; do log_info "    $l"; done || log_warn "  (empty)"
+        # Final fallback: disable SSL verification in leapp EL8 repo files
+        # This only affects the upgrade bootstrap repo, not the installed system
+        log_warn "  HTTPS still failing inside nspawn — applying sslverify=0 fallback..."
+        _leapp_repos_disable_sslverify
     fi
+}
 
-    # Fix 4: If NetworkManager is managing DNS, ensure it wrote resolv.conf
-    if ! "$dns_ok" && command -v nmcli &>/dev/null 2>&1; then
-        log_info "  Refreshing NetworkManager DNS..."
-        nmcli networking off &>/dev/null 2>&1 || true
-        sleep 1
-        nmcli networking on &>/dev/null 2>&1 || true
-        sleep 2
-        # Re-copy after NM refresh
-        cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
-        log_ok "  resolv.conf re-synced after NM refresh."
+# Disable SSL verification in leapp's EL8 repo files as last-resort fallback.
+# Only affects the temporary upgrade bootstrap — not the installed EL8 system.
+_leapp_repos_disable_sslverify() {
+    local repo_file
+    repo_file=$(find /etc/leapp/files/ -name "*.repo" 2>/dev/null | head -1 || true)
+    if [[ -z "$repo_file" ]]; then
+        log_warn "  No leapp EL8 repo file found in /etc/leapp/files/"
+        return
     fi
+    log_info "  Applying sslverify=0 to $repo_file..."
+    # Add sslverify=0 after each [section] header if not already present
+    python2 - "$repo_file" 2>/dev/null << 'PYEOF' || \
+    sed -i '/^\[.*\]/{n; /^sslverify/! s/^/sslverify=0\n/}' "$repo_file" 2>/dev/null || true
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+result = re.sub(
+    r'(\[[^\]]+\]\n)(?!sslverify)',
+    r'\1sslverify=0\n',
+    content
+)
+with open(path, 'w') as f:
+    f.write(result)
+PYEOF
+    log_ok "  sslverify=0 applied to leapp repo files."
+    log_warn "  Note: SSL verification disabled for upgrade bootstrap only."
 }
 
 phase_fix_inhibitors() {
