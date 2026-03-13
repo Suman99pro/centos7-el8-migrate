@@ -51,12 +51,12 @@ MODE=""
 LEAPP_BIN=""
 STATE_FILE=""
 
-# Preflight finding arrays
-PREFLIGHT_BLOCKS=()
-PREFLIGHT_WARNS=()
-PREFLIGHT_AUTOS=()
-PREFLIGHT_INFO=()
-PREFLIGHT_PASS=()
+# Preflight finding arrays — declare explicitly for bash 4.2 (CentOS 7) set -u compatibility
+declare -a PREFLIGHT_BLOCKS=()
+declare -a PREFLIGHT_WARNS=()
+declare -a PREFLIGHT_AUTOS=()
+declare -a PREFLIGHT_INFO=()
+declare -a PREFLIGHT_PASS=()
 
 # ---------------------------------------------------------------------------
 # COLOURS
@@ -183,6 +183,9 @@ parse_args() {
 preflight_reset() {
     PREFLIGHT_BLOCKS=(); PREFLIGHT_WARNS=()
     PREFLIGHT_AUTOS=();  PREFLIGHT_INFO=(); PREFLIGHT_PASS=()
+    # Bash 4.2 (CentOS 7) treats empty arrays as unbound under set -u
+    # Re-declare explicitly to avoid "unbound variable" errors
+    declare -ga PREFLIGHT_BLOCKS PREFLIGHT_WARNS PREFLIGHT_AUTOS PREFLIGHT_INFO PREFLIGHT_PASS
 }
 
 # --- individual checks -------------------------------------------------------
@@ -362,7 +365,7 @@ _pf_repos() {
     done < <(find /etc/yum.repos.d/ -name "*.repo" 2>/dev/null)
 
     if [[ ${#tp[@]} -gt 0 ]]; then
-        pf_warn "Third-party repos: ${tp[*]}. Will be temporarily disabled during upgrade."
+        pf_warn "Third-party repos: ${tp[*]+"${tp[*]}"}. Will be temporarily disabled during upgrade."
     else
         pf_pass "No third-party repos detected."
     fi
@@ -392,7 +395,7 @@ _pf_services() {
             det+=("${s}:$(systemctl is-active "$s" 2>/dev/null || echo inactive)")
     done
     if [[ ${#det[@]} -gt 0 ]]; then
-        pf_info "Critical services detected: ${det[*]}. Verify each restarts correctly post-upgrade."
+        pf_info "Critical services detected: ${det[*]+"${det[*]}"}. Verify each restarts correctly post-upgrade."
     else
         pf_pass "No critical application services detected."
     fi
@@ -423,27 +426,27 @@ print_preflight_report() {
 
     if [[ ${#PREFLIGHT_PASS[@]} -gt 0 ]]; then
         echo -e "${GREEN}${BOLD}✔  PASSED (${#PREFLIGHT_PASS[@]})${RESET}"
-        for i in "${PREFLIGHT_PASS[@]}"; do echo -e "   ${GREEN}✔${RESET} $i"; done; echo
+        for i in "${PREFLIGHT_PASS[@]+"${PREFLIGHT_PASS[@]}"}"; do echo -e "   ${GREEN}✔${RESET} $i"; done; echo
     fi
 
     if [[ ${#PREFLIGHT_INFO[@]} -gt 0 ]]; then
         echo -e "${BLUE}${BOLD}ℹ  INFORMATIONAL (${#PREFLIGHT_INFO[@]})${RESET}"
-        for i in "${PREFLIGHT_INFO[@]}"; do echo -e "   ${BLUE}ℹ${RESET} $i"; done; echo
+        for i in "${PREFLIGHT_INFO[@]+"${PREFLIGHT_INFO[@]}"}"; do echo -e "   ${BLUE}ℹ${RESET} $i"; done; echo
     fi
 
     if [[ ${#PREFLIGHT_AUTOS[@]} -gt 0 ]]; then
         echo -e "${MAGENTA}${BOLD}⚙  AUTO-FIXABLE (${#PREFLIGHT_AUTOS[@]}) — will be fixed automatically${RESET}"
-        for i in "${PREFLIGHT_AUTOS[@]}"; do echo -e "   ${MAGENTA}⚙${RESET} $i"; done; echo
+        for i in "${PREFLIGHT_AUTOS[@]+"${PREFLIGHT_AUTOS[@]}"}"; do echo -e "   ${MAGENTA}⚙${RESET} $i"; done; echo
     fi
 
     if [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
         echo -e "${YELLOW}${BOLD}⚠  WARNINGS — review before proceeding (${#PREFLIGHT_WARNS[@]})${RESET}"
-        for i in "${PREFLIGHT_WARNS[@]}"; do echo -e "   ${YELLOW}⚠${RESET} $i"; done; echo
+        for i in "${PREFLIGHT_WARNS[@]+"${PREFLIGHT_WARNS[@]}"}"; do echo -e "   ${YELLOW}⚠${RESET} $i"; done; echo
     fi
 
     if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
         echo -e "${RED}${BOLD}✖  BLOCKERS — MUST FIX BEFORE MIGRATION (${#PREFLIGHT_BLOCKS[@]})${RESET}"
-        for i in "${PREFLIGHT_BLOCKS[@]}"; do echo -e "   ${RED}✖${RESET} $i"; done; echo
+        for i in "${PREFLIGHT_BLOCKS[@]+"${PREFLIGHT_BLOCKS[@]}"}"; do echo -e "   ${RED}✖${RESET} $i"; done; echo
     fi
 
     echo -e "${BOLD}${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -463,15 +466,15 @@ print_preflight_report() {
         echo "Host: $(hostname -f 2>/dev/null || hostname) | Script: v$SCRIPT_VERSION"
         echo "════════════════════════════════════════════"
         echo; echo "PASSED (${#PREFLIGHT_PASS[@]}):"
-        for i in "${PREFLIGHT_PASS[@]}"; do echo "  [PASS]  $i"; done
+        for i in "${PREFLIGHT_PASS[@]+"${PREFLIGHT_PASS[@]}"}"; do echo "  [PASS]  $i"; done
         echo; echo "INFORMATIONAL:"
-        for i in "${PREFLIGHT_INFO[@]}"; do echo "  [INFO]  $i"; done
+        for i in "${PREFLIGHT_INFO[@]+"${PREFLIGHT_INFO[@]}"}"; do echo "  [INFO]  $i"; done
         echo; echo "AUTO-FIXABLE:"
-        for i in "${PREFLIGHT_AUTOS[@]}"; do echo "  [AUTO]  $i"; done
+        for i in "${PREFLIGHT_AUTOS[@]+"${PREFLIGHT_AUTOS[@]}"}"; do echo "  [AUTO]  $i"; done
         echo; echo "WARNINGS:"
-        for i in "${PREFLIGHT_WARNS[@]}"; do echo "  [WARN]  $i"; done
+        for i in "${PREFLIGHT_WARNS[@]+"${PREFLIGHT_WARNS[@]}"}"; do echo "  [WARN]  $i"; done
         echo; echo "BLOCKERS:"
-        for i in "${PREFLIGHT_BLOCKS[@]}"; do echo "  [BLOCK] $i"; done
+        for i in "${PREFLIGHT_BLOCKS[@]+"${PREFLIGHT_BLOCKS[@]}"}"; do echo "  [BLOCK] $i"; done
         echo
         if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then echo "VERDICT: NOT READY"
         elif [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then echo "VERDICT: PROCEED WITH CAUTION"
@@ -523,8 +526,8 @@ run_autofix() {
         command -v "$t" &>/dev/null || miss+=("$t")
     done
     if [[ ${#miss[@]} -gt 0 ]]; then
-        log_info "Installing missing tools: ${miss[*]}"
-        yum install -y "${miss[@]}" 2>/dev/null || log_warn "Some tools could not install."
+        log_info "Installing missing tools: ${miss[*]+${miss[*]}}"
+        yum install -y "${miss[@]+"${miss[@]}"}" 2>/dev/null || log_warn "Some tools could not install."
     fi
 
     # redhat-release symlink
@@ -892,7 +895,7 @@ phase_fix_inhibitors() {
                 [[ "$d" =~ ^[a-z0-9_]+$ ]] && [[ ${#d} -lt 40 ]] && rdrvs+=("$d")
             fi
         done < <(grep -A 20 "kernel drivers" /var/log/leapp/leapp-report.txt 2>/dev/null || true)
-        for d in "${rdrvs[@]}"; do _blacklist_driver "$d"; done
+        for d in "${rdrvs[@]+"${rdrvs[@]}"}"; do _blacklist_driver "$d"; done
     fi
 
     # Step 4: Universally removed drivers (EL7→EL8 and EL8→EL9)
@@ -1213,7 +1216,7 @@ do_migrate() {
         echo
         log_error "══════════════════════════════════════════════════"
         log_error "MIGRATION BLOCKED — ${#PREFLIGHT_BLOCKS[@]} blocker(s) must be resolved:"
-        for b in "${PREFLIGHT_BLOCKS[@]}"; do log_error "  ✖ $b"; done
+        for b in "${PREFLIGHT_BLOCKS[@]+"${PREFLIGHT_BLOCKS[@]}"}"; do log_error "  ✖ $b"; done
         log_error "══════════════════════════════════════════════════"
         die "Resolve the blockers above and re-run."
     fi
