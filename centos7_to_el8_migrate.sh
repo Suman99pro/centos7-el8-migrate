@@ -871,66 +871,98 @@ prepare_system() {
 # Locate the leapp binary — tries known paths, PATH, full filesystem search,
 # and as a last resort attempts to install the missing leapp package.
 resolve_leapp_bin() {
-    # 1. Check known fixed paths first (fastest)
-    local candidates=(/usr/bin/leapp /bin/leapp /usr/local/bin/leapp)
+    # -----------------------------------------------------------------------
+    # Stage 1: Check all known fixed binary paths
+    # -----------------------------------------------------------------------
+    local candidates=(
+        /usr/bin/leapp
+        /bin/leapp
+        /usr/local/bin/leapp
+        /usr/lib/python2.7/site-packages/leapp/bin/leapp
+    )
     for p in "${candidates[@]}"; do
         if [[ -x "$p" ]]; then
             LEAPP_BIN="$p"
-            log_ok "leapp binary found: $LEAPP_BIN"
+            log_ok "leapp binary found at: $LEAPP_BIN"
             return 0
         fi
     done
 
-    # 2. Check PATH
+    # Stage 2: Check PATH
     if command -v leapp &>/dev/null 2>&1; then
         LEAPP_BIN="$(command -v leapp)"
         log_ok "leapp binary found via PATH: $LEAPP_BIN"
         return 0
     fi
 
-    # 3. Search entire filesystem (catches non-standard install paths)
-    log_warn "leapp not in standard paths — searching filesystem..."
+    # Stage 3: Full filesystem search for any executable named leapp
+    log_info "Searching filesystem for leapp binary..."
     local found
-    found=$(find /usr /bin /opt /usr/local -name "leapp" -type f -executable 2>/dev/null | head -1)
+    found=$(find / -name "leapp" -type f -executable 2>/dev/null             | grep -v proc | grep -v sys | head -1)
     if [[ -n "$found" ]]; then
         LEAPP_BIN="$found"
         log_ok "leapp binary found via filesystem search: $LEAPP_BIN"
         return 0
     fi
 
-    # 4. Binary missing — the 'leapp' framework RPM was not installed
-    # This is the most common cause: only leapp-upgrade-el7toel8 was installed,
-    # not the 'leapp' package itself which provides the binary.
-    log_warn "leapp binary not found — attempting to install missing 'leapp' package..."
-    yum install -y leapp 2>&1 | tail -10 || true
-
-    # Re-check after install attempt
-    for p in /usr/bin/leapp /bin/leapp; do
-        if [[ -x "$p" ]]; then
-            LEAPP_BIN="$p"
-            log_ok "leapp binary available after install: $LEAPP_BIN"
-            return 0
-        fi
-    done
-    if command -v leapp &>/dev/null 2>&1; then
-        LEAPP_BIN="$(command -v leapp)"
-        log_ok "leapp binary available after install: $LEAPP_BIN"
+    # Stage 4: Query RPM to find what file the installed package provides
+    log_info "Checking RPM file lists for leapp binary location..."
+    local rpm_leapp_bin
+    rpm_leapp_bin=$(rpm -ql leapp 2>/dev/null | grep -E "bin/leapp$" | head -1)
+    if [[ -z "$rpm_leapp_bin" ]]; then
+        rpm_leapp_bin=$(rpm -ql python2-leapp 2>/dev/null | grep -E "bin/leapp$" | head -1)
+    fi
+    if [[ -z "$rpm_leapp_bin" ]]; then
+        rpm_leapp_bin=$(rpm -ql leapp-upgrade-el7toel8 2>/dev/null | grep -E "bin/leapp$" | head -1)
+    fi
+    if [[ -n "$rpm_leapp_bin" ]] && [[ -x "$rpm_leapp_bin" ]]; then
+        LEAPP_BIN="$rpm_leapp_bin"
+        log_ok "leapp binary found via RPM file list: $LEAPP_BIN"
         return 0
     fi
 
-    # 5. Completely failed — give detailed diagnostic
-    log_error "============================================================"
-    log_error "leapp binary could not be found or installed."
-    log_error "Diagnostic info:"
-    log_error "  rpm -qa | grep leapp:"
-    rpm -qa 2>/dev/null | grep -i leapp | while read -r p; do log_error "    $p"; done
-    log_error "  yum repolist | grep elevate:"
-    yum repolist all 2>/dev/null | grep -i elevate | while read -r l; do log_error "    $l"; done
-    log_error "Manual fix:"
-    log_error "  yum-config-manager --enable elevate"
-    log_error "  yum install -y leapp"
-    log_error "============================================================"
-    die "Cannot proceed without leapp binary."
+    # Stage 5: Binary not installed — try every known package that provides it
+    log_warn "leapp binary not found — trying to install provider packages..."
+    local provider_pkgs=(leapp python2-leapp leapp-framework)
+    for pkg in "${provider_pkgs[@]}"; do
+        log_info "  Trying: yum install -y $pkg ..."
+        yum install -y "$pkg" 2>&1 | tail -5 || true
+        # Re-check immediately after each install attempt
+        for p in /usr/bin/leapp /bin/leapp; do
+            if [[ -x "$p" ]]; then
+                LEAPP_BIN="$p"
+                log_ok "leapp binary available after installing $pkg: $LEAPP_BIN"
+                return 0
+            fi
+        done
+        if command -v leapp &>/dev/null 2>&1; then
+            LEAPP_BIN="$(command -v leapp)"
+            log_ok "leapp binary available after installing $pkg: $LEAPP_BIN"
+            return 0
+        fi
+    done
+
+    # Stage 6: Final diagnostic dump and hard exit
+    echo
+    log_error "================================================================"
+    log_error "FATAL: leapp binary cannot be found or installed."
+    log_error "Installed leapp-related packages:"
+    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" |         while read -r pkg; do log_error "  $pkg"; done
+    log_error "Files provided by installed leapp packages:"
+    for pkg in leapp python2-leapp leapp-upgrade-el7toel8; do
+        if rpm -q "$pkg" &>/dev/null 2>&1; then
+            rpm -ql "$pkg" 2>/dev/null | grep -v "^(contains no files)" |                 while read -r f; do log_error "  [$pkg] $f"; done
+        fi
+    done
+    log_error "ELevate repo status:"
+    yum repolist all 2>/dev/null | grep -i elevate |         while read -r l; do log_error "  $l"; done
+    log_error "----------------------------------------------------------------"
+    log_error "Manual fix options:"
+    log_error "  1. yum-config-manager --enable elevate && yum install -y leapp"
+    log_error "  2. Check: rpm -ql leapp-upgrade-el7toel8 | grep bin"
+    log_error "  3. Check ELevate docs: https://wiki.almalinux.org/elevate/"
+    log_error "================================================================"
+    die "Cannot proceed without leapp binary. See diagnostics above."
 }
 
 install_elevate() {
@@ -938,78 +970,56 @@ install_elevate() {
 
     local elevate_url="https://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm"
 
-    # Install elevate-release only if not already installed
+    # Step 1: Install elevate-release repo package
     if rpm -q elevate-release &>/dev/null 2>&1; then
-        log_ok "elevate-release already installed — skipping."
+        log_ok "elevate-release already installed."
     else
         log_info "Installing ELevate release package..."
         yum install -y "$elevate_url" 2>&1 | tail -10
         log_ok "elevate-release installed."
     fi
 
-    # Always ensure the elevate repo is enabled (installs disabled by default)
-    log_info "Ensuring ELevate repo is enabled..."
-    if yum-config-manager --enable elevate &>/dev/null 2>&1; then
-        log_ok "ELevate repo enabled via yum-config-manager."
-    else
-        sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
-        log_ok "ELevate repo enabled via repo file."
-    fi
+    # Step 2: Force-enable the elevate repo (defaults to disabled after install)
+    log_info "Enabling ELevate repo..."
+    yum-config-manager --enable elevate &>/dev/null 2>&1 ||         sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
     yum clean all &>/dev/null
+    log_ok "ELevate repo enabled."
 
-    log_info "Installing leapp-upgrade and target OS data..."
-
-    # Step 1: Install the leapp FRAMEWORK package first — this provides the binary
-    # This is separate from leapp-upgrade which only provides upgrade actors/data
-    log_info "Installing leapp framework (provides /usr/bin/leapp binary)..."
-    yum install -y leapp 2>&1 | tail -10 || true
-    if ! rpm -q leapp &>/dev/null 2>&1; then
-        log_warn "leapp framework package not found in repo — trying python2-leapp..."
-        yum install -y python2-leapp 2>&1 | tail -10 || true
-    fi
-
-    # Step 2: Install upgrade actors and distro data
-    # Package name varies by ELevate version:
-    # older: leapp-upgrade  newer: leapp-upgrade-el7toel8
-    leapp_pkg_installed() {
-        rpm -q leapp-upgrade &>/dev/null 2>&1 ||         rpm -q leapp-upgrade-el7toel8 &>/dev/null 2>&1
-    }
-
+    # Step 3: Install ALL leapp packages in one transaction
+    # Note: leapp-upgrade-el7toel8 is the actual package that provides
+    # the /usr/bin/leapp binary via Python entry_points on this ELevate version.
+    # We install every known package name so it works across all ELevate versions.
+    log_info "Installing all leapp packages..."
     case "$TARGET_DISTRO" in
         alma)
-            log_info "Installing leapp-upgrade and AlmaLinux data..."
-            yum install -y leapp-upgrade leapp-data-almalinux 2>&1 | tail -20 || true
-            if ! leapp_pkg_installed; then
-                die "leapp-upgrade failed to install. Check yum output above."
-            fi
-            if ! rpm -q leapp-data-almalinux &>/dev/null 2>&1; then
-                die "leapp-data-almalinux failed to install. Check yum output above."
-            fi
+            yum install -y                 leapp                 python2-leapp                 leapp-upgrade                 leapp-data-almalinux                 2>&1 | tail -30
             ;;
         rocky)
-            log_info "Installing leapp-upgrade and Rocky Linux data..."
-            yum install -y leapp-upgrade leapp-data-rocky 2>&1 | tail -20 ||             yum install -y leapp-upgrade python2-leapp 2>&1 | tail -20 || true
-            if ! leapp_pkg_installed; then
-                die "leapp-upgrade failed to install. Check yum output above."
-            fi
+            yum install -y                 leapp                 python2-leapp                 leapp-upgrade                 leapp-data-rocky                 2>&1 | tail -30
             ;;
         *)
             die "Unknown target distro: $TARGET_DISTRO"
             ;;
     esac
 
-    # Step 3: Verify the leapp binary is now available
-    local leapp_bin
-    leapp_bin=$(command -v leapp 2>/dev/null ||                 find /usr/bin /bin /usr/local/bin -name "leapp" -type f 2>/dev/null | head -1)
-    if [[ -z "$leapp_bin" ]]; then
-        die "leapp binary still not found after installation. Check: rpm -ql leapp"
-    fi
-    log_ok "ELevate packages installed."
+    # Step 4: Verify distro data package landed
+    case "$TARGET_DISTRO" in
+        alma)
+            if ! rpm -q leapp-data-almalinux &>/dev/null 2>&1; then
+                die "leapp-data-almalinux failed to install. Check ELevate repo."
+            fi ;;
+        rocky)
+            if ! rpm -q leapp-data-rocky &>/dev/null 2>&1; then
+                die "leapp-data-rocky failed to install. Check ELevate repo."
+            fi ;;
+    esac
 
-    # Resolve and set LEAPP_BIN immediately so all subsequent functions can use it
+    log_info "Installed leapp-related packages:"
+    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" |         while read -r p; do log_info "  $p"; done
+
+    # Step 5: Resolve binary — sets global LEAPP_BIN
     resolve_leapp_bin
 }
-
 run_preupgrade_check() {
     log_section "Running leapp pre-upgrade analysis..."
 
@@ -1202,17 +1212,31 @@ fix_leapp_inhibitors() {
 
     # -------------------------------------------------------------------------
     # STEP 7: Remove remaining ABRT packages if still present
-    # These are known to cause transaction conflicts during leapp upgrade
+    # IMPORTANT: Use --noautoremove to prevent yum from cascade-removing
+    # leapp-upgrade-el7toel8 and other packages that depend on libreport.
     # -------------------------------------------------------------------------
-    log_info "Removing any remaining ABRT packages..."
+    log_info "Removing any remaining ABRT packages (safe mode — no autoremove)..."
     local abrt_pkgs
-    abrt_pkgs=$(rpm -qa 2>/dev/null | grep "^abrt\|^libreport" || true)
+    abrt_pkgs=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
     if [[ -n "$abrt_pkgs" ]]; then
-        log_info "  Found ABRT packages: removing..."
-        echo "$abrt_pkgs" | xargs yum remove -y 2>/dev/null || true
+        log_info "  Found ABRT packages: removing safely..."
+        # Remove only explicit abrt packages — NOT libreport which leapp depends on
+        # Use --setopt=clean_requirements_on_remove=0 to prevent cascade removal
+        echo "$abrt_pkgs" | xargs yum remove -y             --setopt=clean_requirements_on_remove=0 2>/dev/null || true
         log_ok "  ABRT packages removed."
     else
         log_ok "  No ABRT packages found."
+    fi
+
+    # Safety check: if leapp packages were accidentally removed, reinstall them
+    if ! rpm -q leapp-upgrade &>/dev/null 2>&1 &&        ! rpm -q leapp-upgrade-el7toel8 &>/dev/null 2>&1; then
+        log_warn "leapp-upgrade was removed as a dependency — reinstalling..."
+        yum-config-manager --enable elevate &>/dev/null 2>&1 || true
+        case "$TARGET_DISTRO" in
+            alma) yum install -y leapp leapp-upgrade leapp-data-almalinux 2>&1 | tail -10 || true ;;
+            rocky) yum install -y leapp leapp-upgrade leapp-data-rocky 2>&1 | tail -10 || true ;;
+        esac
+        log_ok "leapp packages restored."
     fi
 
     # -------------------------------------------------------------------------
