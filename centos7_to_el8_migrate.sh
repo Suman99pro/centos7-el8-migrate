@@ -913,6 +913,16 @@ install_elevate() {
 
     log_info "Installing leapp-upgrade and target OS data..."
 
+    # Step 1: Install the leapp FRAMEWORK package first — this provides the binary
+    # This is separate from leapp-upgrade which only provides upgrade actors/data
+    log_info "Installing leapp framework (provides /usr/bin/leapp binary)..."
+    yum install -y leapp 2>&1 | tail -10 || true
+    if ! rpm -q leapp &>/dev/null 2>&1; then
+        log_warn "leapp framework package not found in repo — trying python2-leapp..."
+        yum install -y python2-leapp 2>&1 | tail -10 || true
+    fi
+
+    # Step 2: Install upgrade actors and distro data
     # Package name varies by ELevate version:
     # older: leapp-upgrade  newer: leapp-upgrade-el7toel8
     leapp_pkg_installed() {
@@ -921,8 +931,8 @@ install_elevate() {
 
     case "$TARGET_DISTRO" in
         alma)
+            log_info "Installing leapp-upgrade and AlmaLinux data..."
             yum install -y leapp-upgrade leapp-data-almalinux 2>&1 | tail -20 || true
-            # Verify the packages actually landed (handle both package name variants)
             if ! leapp_pkg_installed; then
                 die "leapp-upgrade failed to install. Check yum output above."
             fi
@@ -931,8 +941,8 @@ install_elevate() {
             fi
             ;;
         rocky)
-            yum install -y leapp-upgrade leapp-data-rocky 2>&1 | tail -20 || \
-            yum install -y leapp-upgrade python2-leapp 2>&1 | tail -20 || true
+            log_info "Installing leapp-upgrade and Rocky Linux data..."
+            yum install -y leapp-upgrade leapp-data-rocky 2>&1 | tail -20 ||             yum install -y leapp-upgrade python2-leapp 2>&1 | tail -20 || true
             if ! leapp_pkg_installed; then
                 die "leapp-upgrade failed to install. Check yum output above."
             fi
@@ -942,7 +952,14 @@ install_elevate() {
             ;;
     esac
 
-    log_ok "ELevate/leapp installed."
+    # Step 3: Verify the leapp binary is now available
+    local leapp_bin
+    leapp_bin=$(command -v leapp 2>/dev/null ||                 find /usr/bin /bin /usr/local/bin -name "leapp" -type f 2>/dev/null | head -1)
+    if [[ -z "$leapp_bin" ]]; then
+        die "leapp binary still not found after installation. Check: rpm -ql leapp"
+    fi
+    log_ok "leapp binary confirmed at: $leapp_bin"
+    log_ok "ELevate/leapp fully installed."
 }
 
 run_preupgrade_check() {
