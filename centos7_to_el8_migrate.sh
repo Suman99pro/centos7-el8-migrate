@@ -1253,9 +1253,51 @@ fix_leapp_inhibitors() {
     mkdir -p /var/log/leapp /etc/leapp/files 2>/dev/null || true
 
     # -------------------------------------------------------------------------
+    # STEP 10: Disable IPv6 if not functional
+    # leapp's systemd-nspawn container inherits the host network stack.
+    # If IPv6 is enabled but has no working connectivity, dnf inside the
+    # container will try AAAA records first, hang on connect, and ALL
+    # AlmaLinux/Rocky 8 repos will fail to sync — causing the
+    # "Unable to install RHEL 8 userspace packages" error.
+    # -------------------------------------------------------------------------
+    log_info "Step 10: Checking IPv6 connectivity for leapp nspawn container..."
+    local ipv6_working=false
+    # Test IPv6 by trying to reach a well-known IPv6 address (Google DNS)
+    if ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
+        ipv6_working=true
+    fi
+
+    if [[ "$ipv6_working" == "false" ]]; then
+        local ipv6_disabled
+        ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
+        if [[ "$ipv6_disabled" == "0" ]]; then
+            log_warn "IPv6 is enabled but not working — disabling to prevent leapp repo failures."
+            log_warn "  (leapp's dnf tries IPv6 first; broken IPv6 causes all repo syncs to hang/fail)"
+            # Apply immediately via sysctl
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
+            # Persist across reboots
+            if ! grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
+                cat >> /etc/sysctl.conf <<'SYSCTL'
+
+# Disabled by migration script: IPv6 not functional on this host
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+SYSCTL
+            fi
+            log_ok "IPv6 disabled (sysctl applied immediately + persisted to /etc/sysctl.conf)."
+            log_info "  Note: Re-enable IPv6 post-upgrade if needed: sysctl -w net.ipv6.conf.all.disable_ipv6=0"
+        else
+            log_ok "IPv6 already disabled — no action needed."
+        fi
+    else
+        log_ok "IPv6 connectivity confirmed — no changes needed."
+    fi
+
+    # -------------------------------------------------------------------------
     # SUMMARY: Log all remaining items from leapp report for awareness
     # -------------------------------------------------------------------------
-    log_info "Step 10: Non-inhibitor HIGH risk items (informational):"
+    log_info "Step 11: Non-inhibitor HIGH risk items (informational):"
     log_info "  • e1000 driver     → replaced by e1000e in EL8/EL9 (automatic)"
     log_info "  • Python 2         → run 'alternatives --set python /usr/bin/python3' post-upgrade"
     log_info "  • SELinux           → leapp sets permissive; re-enable enforcing post-upgrade"
