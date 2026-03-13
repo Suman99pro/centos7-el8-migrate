@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -254,6 +254,18 @@ _pf_network() {
         fi
     else
         pf_pass "IPv6: already disabled (safe for leapp)."
+    fi
+
+    # Check if a leapp nspawn overlay exists and has a broken resolv.conf
+    local overlay
+    overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
+    if [[ -n "$overlay" ]]; then
+        local overlay_resolv="${overlay}/etc/resolv.conf"
+        if [[ ! -s "$overlay_resolv" ]]; then
+            pf_auto "leapp nspawn overlay exists but has empty/missing resolv.conf ($overlay_resolv). Will be fixed — this causes all repo syncs to fail inside the container."
+        else
+            pf_pass "leapp nspawn overlay resolv.conf present."
+        fi
     fi
 }
 
@@ -534,6 +546,19 @@ run_autofix() {
     if [[ ! -f /etc/redhat-release ]] && [[ -f /etc/centos-release ]]; then
         ln -sf /etc/centos-release /etc/redhat-release 2>/dev/null || true
         log_ok "Fixed /etc/redhat-release symlink."
+    fi
+
+    # nspawn overlay resolv.conf — fix if overlay already exists from a previous run
+    local overlay
+    overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
+    if [[ -n "$overlay" ]]; then
+        local overlay_resolv="${overlay}/etc/resolv.conf"
+        if [[ ! -s "$overlay_resolv" ]]; then
+            log_info "Fixing leapp nspawn overlay resolv.conf..."
+            mkdir -p "${overlay}/etc" 2>/dev/null || true
+            cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
+            log_ok "nspawn overlay resolv.conf fixed."
+        fi
     fi
 
     log_ok "Auto-fix complete. Re-run --assess to verify."
@@ -862,6 +887,89 @@ _blacklist_driver() {
         rmmod "$drv" 2>/dev/null && log_ok "  Unloaded: $drv" || true
 }
 
+# ---------------------------------------------------------------------------
+# Fix leapp nspawn container network — the container builds an EL8 userspace
+# overlay and runs dnf inside systemd-nspawn. The overlay gets its own
+# /etc/resolv.conf which is often empty/missing → all repo syncs fail even
+# though host networking is fine.
+# ---------------------------------------------------------------------------
+fix_nspawn_network() {
+    log_info "Checking leapp nspawn overlay network configuration..."
+
+    # Locate the overlay directory leapp creates
+    local overlay=""
+    local search_paths=(
+        "/var/lib/leapp/scratch/mounts/root_/system_overlay"
+        "/var/lib/leapp/scratch/mounts/root_overlay"
+    )
+    # Also search dynamically in case path differs between leapp versions
+    local found
+    found=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
+    [[ -n "$found" ]] && search_paths+=("$found")
+
+    for p in "${search_paths[@]}"; do
+        if [[ -d "$p" ]]; then overlay="$p"; break; fi
+    done
+
+    if [[ -z "$overlay" ]]; then
+        log_info "  nspawn overlay not yet created (normal before first preupgrade run)."
+        return 0
+    fi
+
+    log_info "  Found overlay: $overlay"
+
+    # Fix 1: /etc/resolv.conf — copy from host if missing or empty
+    local overlay_resolv="${overlay}/etc/resolv.conf"
+    mkdir -p "${overlay}/etc" 2>/dev/null || true
+    if [[ ! -s "$overlay_resolv" ]]; then
+        log_warn "  Overlay /etc/resolv.conf is missing or empty — copying from host..."
+        cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
+        log_ok "  Overlay resolv.conf fixed: $(cat "$overlay_resolv" | head -3 | tr '\n' ' ')"
+    else
+        log_ok "  Overlay resolv.conf present: $(head -1 "$overlay_resolv")"
+    fi
+
+    # Fix 2: /etc/hosts — copy from host if missing or empty
+    local overlay_hosts="${overlay}/etc/hosts"
+    if [[ ! -s "$overlay_hosts" ]]; then
+        log_warn "  Overlay /etc/hosts is missing or empty — copying from host..."
+        cp -f /etc/hosts "$overlay_hosts" 2>/dev/null || true
+        log_ok "  Overlay /etc/hosts fixed."
+    fi
+
+    # Fix 3: verify DNS works inside the nspawn container
+    # Use a lightweight test — just resolve one hostname
+    log_info "  Testing DNS inside nspawn container..."
+    local dns_ok=false
+    if systemd-nspawn --register=no --quiet -D "$overlay" \
+        bash -c "getent hosts repo.almalinux.org" &>/dev/null 2>&1; then
+        dns_ok=true
+        log_ok "  DNS inside nspawn: working."
+    elif systemd-nspawn --register=no --quiet -D "$overlay" \
+        bash -c "curl -4 --silent --max-time 5 --head https://repo.almalinux.org" &>/dev/null 2>&1; then
+        dns_ok=true
+        log_ok "  Network inside nspawn: working (curl test)."
+    else
+        log_warn "  DNS/network inside nspawn not verified — resolv.conf may still be wrong."
+        log_info "  Host resolv.conf content:"
+        cat /etc/resolv.conf | while read -r l; do log_info "    $l"; done
+        log_info "  Overlay resolv.conf content:"
+        cat "$overlay_resolv" 2>/dev/null | while read -r l; do log_info "    $l"; done || log_warn "  (empty)"
+    fi
+
+    # Fix 4: If NetworkManager is managing DNS, ensure it wrote resolv.conf
+    if ! "$dns_ok" && command -v nmcli &>/dev/null 2>&1; then
+        log_info "  Refreshing NetworkManager DNS..."
+        nmcli networking off &>/dev/null 2>&1 || true
+        sleep 1
+        nmcli networking on &>/dev/null 2>&1 || true
+        sleep 2
+        # Re-copy after NM refresh
+        cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
+        log_ok "  resolv.conf re-synced after NM refresh."
+    fi
+}
+
 phase_fix_inhibitors() {
     log_section "Phase 4b: Universal Inhibitor Remediation"
 
@@ -972,6 +1080,12 @@ phase_fix_inhibitors() {
         log_ok "IPv6 disabled."
     fi
 
+    # Step 12: Fix nspawn overlay network (resolv.conf missing/empty in container)
+    # This is the most common cause of "Failed to synchronize cache for repo"
+    # even when host network is working perfectly.
+    log_info "Step 12: Fixing nspawn overlay network configuration..."
+    fix_nspawn_network
+
     state_set "PHASE_INHIBITORS" "complete"
     log_ok "Inhibitor remediation complete."
 }
@@ -997,6 +1111,11 @@ phase_preupgrade() {
 
         local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
         "$LEAPP_BIN" preupgrade 2>&1 | tee "$plog" || true
+
+        # Fix nspawn overlay network immediately after leapp creates it.
+        # The overlay is built during preupgrade — resolv.conf is often empty.
+        # This must run AFTER preupgrade (overlay exists) and BEFORE the next attempt.
+        fix_nspawn_network
 
         if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
             log_error "leapp report not generated. See: $plog"
