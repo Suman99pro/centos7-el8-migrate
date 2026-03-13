@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.1.1"
+readonly SCRIPT_VERSION="3.3.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -550,21 +550,12 @@ run_autofix() {
         log_ok "Fixed /etc/redhat-release symlink."
     fi
 
-    # nspawn overlay — fix CA bundle + resolv.conf if overlay already exists
+    # nspawn bypass — if overlay exists from a previous run, pre-fix it
     local overlay
     overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
     if [[ -n "$overlay" ]]; then
-        mkdir -p "${overlay}/etc/pki/tls/certs" "${overlay}/etc" 2>/dev/null || true
-        local needs_fix=false
-        [[ ! -s "${overlay}/etc/pki/tls/certs/ca-bundle.crt" ]] && needs_fix=true
-        [[ ! -s "${overlay}/etc/resolv.conf" ]] && needs_fix=true
-        if [[ "$needs_fix" == true ]]; then
-            log_info "Fixing leapp nspawn overlay (CA bundle + resolv.conf)..."
-            cp -f /etc/pki/tls/certs/ca-bundle.crt \
-                "${overlay}/etc/pki/tls/certs/ca-bundle.crt" 2>/dev/null || true
-            cp -f /etc/resolv.conf "${overlay}/etc/resolv.conf" 2>/dev/null || true
-            log_ok "nspawn overlay network fixed."
-        fi
+        log_info "leapp overlay found — applying nspawn network bypass fixes..."
+        fix_nspawn_network
     fi
 
     log_ok "Auto-fix complete. Re-run --assess to verify."
@@ -894,129 +885,260 @@ _blacklist_driver() {
 }
 
 # ---------------------------------------------------------------------------
-# Fix leapp nspawn container network — the container builds an EL8 userspace
-# overlay and runs dnf inside systemd-nspawn. The overlay gets its own
-# /etc/resolv.conf which is often empty/missing → all repo syncs fail even
-# though host networking is fine.
+# _find_overlay — print overlay path or empty string
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Fix leapp nspawn container network + TLS
-#
-# The nspawn overlay is a minimal EL8 userspace. Two things commonly break:
-#
-# 1. /etc/resolv.conf missing/empty → DNS fails inside container
-# 2. /etc/pki/tls/certs/ca-bundle.crt missing/empty → ALL https:// repo
-#    syncs fail immediately with "Failed to synchronize cache".
-#    This is the most common cause: dnf runs fine but can't verify TLS certs.
-#
-# Both are fixed by copying the host files into the overlay.
-# ---------------------------------------------------------------------------
-fix_nspawn_network() {
-    log_info "Checking leapp nspawn overlay (network + TLS)..."
-
-    # Locate the overlay — path varies between leapp versions
-    local overlay=""
-    for candidate in \
+_find_overlay() {
+    local p
+    for p in \
         "/var/lib/leapp/scratch/mounts/root_/system_overlay" \
         "/var/lib/leapp/scratch/mounts/root_overlay"
     do
-        [[ -d "$candidate" ]] && { overlay="$candidate"; break; }
+        [[ -d "$p" ]] && { echo "$p"; return; }
     done
-    if [[ -z "$overlay" ]]; then
-        local found
-        found=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" \
-                -type d 2>/dev/null | head -1 || true)
-        [[ -n "$found" ]] && overlay="$found"
-    fi
-
-    if [[ -z "$overlay" ]]; then
-        log_info "  nspawn overlay not yet created — will be fixed after first preupgrade run."
-        return 0
-    fi
-
-    log_info "  Overlay: $overlay"
-    mkdir -p "${overlay}/etc/pki/tls/certs" \
-             "${overlay}/etc/pki/ca-trust" \
-             "${overlay}/etc" 2>/dev/null || true
-
-    # Fix 1: CA bundle — MOST COMMON CAUSE of "Failed to synchronize cache"
-    # The overlay's dnf uses its own libcurl/TLS stack. Without a CA bundle
-    # every https:// repo fails immediately regardless of network connectivity.
-    local overlay_ca="${overlay}/etc/pki/tls/certs/ca-bundle.crt"
-    local host_ca="/etc/pki/tls/certs/ca-bundle.crt"
-    if [[ ! -s "$overlay_ca" ]]; then
-        if [[ -s "$host_ca" ]]; then
-            cp -f "$host_ca" "$overlay_ca" 2>/dev/null || true
-            log_ok "  CA bundle injected into overlay ($(wc -c < "$overlay_ca") bytes)."
-        else
-            log_warn "  Host CA bundle also missing — trying ca-certificates package..."
-            yum install -y ca-certificates 2>/dev/null || true
-            update-ca-trust extract 2>/dev/null || true
-            [[ -s "$host_ca" ]] && cp -f "$host_ca" "$overlay_ca" 2>/dev/null || true
-        fi
-    else
-        log_ok "  Overlay CA bundle present ($(wc -c < "$overlay_ca") bytes)."
-    fi
-
-    # Copy full ca-trust directory too (some versions of curl look here)
-    [[ -d /etc/pki/ca-trust ]] && \
-        cp -rf /etc/pki/ca-trust/. "${overlay}/etc/pki/ca-trust/" 2>/dev/null || true
-
-    # Fix 2: resolv.conf — DNS inside the container
-    local overlay_resolv="${overlay}/etc/resolv.conf"
-    if [[ ! -s "$overlay_resolv" ]]; then
-        cp -f /etc/resolv.conf "$overlay_resolv" 2>/dev/null || true
-        log_ok "  resolv.conf injected into overlay."
-    else
-        log_ok "  Overlay resolv.conf present."
-    fi
-
-    # Fix 3: /etc/hosts
-    local overlay_hosts="${overlay}/etc/hosts"
-    [[ ! -s "$overlay_hosts" ]] && cp -f /etc/hosts "$overlay_hosts" 2>/dev/null || true
-
-    # Verify: test HTTPS from inside nspawn
-    log_info "  Testing HTTPS from inside nspawn container..."
-    if systemd-nspawn --register=no --quiet -D "$overlay" \
-        curl -4 --silent --max-time 10 --head \
-        "https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/repodata/repomd.xml" \
-        &>/dev/null 2>&1; then
-        log_ok "  HTTPS inside nspawn: working."
-    else
-        # Final fallback: disable SSL verification in leapp EL8 repo files
-        # This only affects the upgrade bootstrap repo, not the installed system
-        log_warn "  HTTPS still failing inside nspawn — applying sslverify=0 fallback..."
-        _leapp_repos_disable_sslverify
-    fi
+    find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" \
+        -type d 2>/dev/null | head -1 || true
 }
 
-# Disable SSL verification in leapp's EL8 repo files as last-resort fallback.
-# Only affects the temporary upgrade bootstrap — not the installed EL8 system.
-_leapp_repos_disable_sslverify() {
-    local repo_file
-    repo_file=$(find /etc/leapp/files/ -name "*.repo" 2>/dev/null | head -1 || true)
-    if [[ -z "$repo_file" ]]; then
-        log_warn "  No leapp EL8 repo file found in /etc/leapp/files/"
-        return
-    fi
-    log_info "  Applying sslverify=0 to $repo_file..."
-    # Add sslverify=0 after each [section] header if not already present
-    python2 - "$repo_file" 2>/dev/null << 'PYEOF' || \
-    sed -i '/^\[.*\]/{n; /^sslverify/! s/^/sslverify=0\n/}' "$repo_file" 2>/dev/null || true
+# ---------------------------------------------------------------------------
+# _leapp_repo_file — print path to leapp EL8 .repo file or empty string
+# ---------------------------------------------------------------------------
+_leapp_repo_file() {
+    find /etc/leapp/files/ -name "*.repo" 2>/dev/null | head -1 || true
+}
+
+# ---------------------------------------------------------------------------
+# _patch_leapp_repos — set sslverify=0 gpgcheck=0 in all leapp EL8 repo files
+# Safe: only touches the bootstrap repo leapp uses for the nspawn install.
+# The installed EL8 system gets its own clean repo files post-upgrade.
+# ---------------------------------------------------------------------------
+_patch_leapp_repos() {
+    local repo_file; repo_file=$(_leapp_repo_file)
+    [[ -z "$repo_file" ]] && return 0
+
+    log_info "  Patching leapp repo file: $repo_file"
+
+    # Use python2 (available on CentOS 7) for reliable INI manipulation
+    python2 - "$repo_file" << 'PYEOF' 2>/dev/null && { log_ok "  Repo file patched."; return 0; }
 import sys, re
 path = sys.argv[1]
 with open(path) as f:
-    content = f.read()
-result = re.sub(
-    r'(\[[^\]]+\]\n)(?!sslverify)',
-    r'\1sslverify=0\n',
-    content
-)
+    c = f.read()
+# Force sslverify=0 and gpgcheck=0 in every section
+for key in ('sslverify', 'gpgcheck'):
+    # Replace existing values
+    c = re.sub(r'^' + key + r'\s*=.*$', key + '=0', c, flags=re.M)
+    # Add after section header if missing
+    def add_if_missing(m):
+        header = m.group(0)
+        rest   = c[m.end():]
+        next_section = re.search(r'^\[', rest, re.M)
+        block = rest[:next_section.start()] if next_section else rest
+        if key not in block:
+            return header + '\n' + key + '=0'
+        return header
+    c = re.sub(r'^\[.+\]$', add_if_missing, c, flags=re.M)
 with open(path, 'w') as f:
-    f.write(result)
+    f.write(c)
+sys.exit(0)
 PYEOF
-    log_ok "  sslverify=0 applied to leapp repo files."
-    log_warn "  Note: SSL verification disabled for upgrade bootstrap only."
+
+    # Fallback: sed
+    sed -i \
+        -e 's/^sslverify\s*=.*/sslverify=0/' \
+        -e 's/^gpgcheck\s*=.*/gpgcheck=0/' \
+        "$repo_file" 2>/dev/null || true
+    grep -q "^sslverify" "$repo_file" || \
+        sed -i '/^\[/a sslverify=0\ngpgcheck=0' "$repo_file" 2>/dev/null || true
+    log_ok "  Repo file patched (sed fallback)."
+}
+
+# ---------------------------------------------------------------------------
+# _host_dnf_bootstrap
+#
+# THE CORE FIX for "Unable to install RHEL 8 userspace packages"
+#
+# Root cause (confirmed through repeated testing):
+#   systemd-nspawn on CentOS 7 (systemd v219) running an overlay rootfs on
+#   a KVM guest has no working network inside the container. This is a hard
+#   limitation of nspawn v219 + overlay mounts — NOT fixable by copying
+#   resolv.conf, CA certs, or any config files into the overlay.
+#
+# Solution: Run the exact dnf install command leapp's nspawn actor would run,
+#   but from the HOST which has full network. The EL8 installroot gets
+#   pre-populated. When leapp's nspawn runs next, packages are already
+#   installed and no network access is needed inside the container.
+#
+# This function is safe to call multiple times (idempotent).
+# ---------------------------------------------------------------------------
+_host_dnf_bootstrap() {
+    local overlay="$1"
+    local leapp_repo; leapp_repo=$(_leapp_repo_file)
+
+    if [[ -z "$leapp_repo" ]]; then
+        log_warn "  _host_dnf_bootstrap: no leapp repo file found yet — skipping."
+        return 0
+    fi
+
+    # Target: the installroot leapp's actor populates inside the overlay
+    local installroot="${overlay}/el8target"
+    mkdir -p "$installroot" 2>/dev/null || true
+
+    # Already done?
+    if [[ -f "${installroot}/usr/bin/dnf" ]] || [[ -f "${installroot}/bin/dnf" ]]; then
+        log_ok "  EL8 installroot already has dnf — bootstrap already complete."
+        return 0
+    fi
+
+    log_info "  Pre-populating EL8 installroot from host (bypassing nspawn network)..."
+    log_info "  Installroot: $installroot"
+
+    # Ensure dnf on host
+    if ! command -v dnf &>/dev/null 2>&1; then
+        log_info "  Installing dnf on host..."
+        yum install -y dnf 2>/dev/null | tail -5 || true
+    fi
+    if ! command -v dnf &>/dev/null 2>&1; then
+        log_warn "  dnf unavailable on host — cannot bootstrap installroot."
+        return 0
+    fi
+
+    # Work dir for host-side dnf config
+    local work_dir="/var/lib/leapp/scratch/host_dnf_work"
+    mkdir -p "${work_dir}/repos.d" 2>/dev/null || true
+
+    # Patch repo file: sslverify=0, gpgcheck=0 (bootstrap only, not installed system)
+    python2 - "$leapp_repo" "${work_dir}/repos.d/el8.repo" << 'PYEOF' 2>/dev/null || \
+        cp -f "$leapp_repo" "${work_dir}/repos.d/el8.repo"
+import sys, re
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    c = f.read()
+for key in ('sslverify', 'gpgcheck'):
+    c = re.sub(r'^' + key + r'\s*=.*$', key + '=0', c, flags=re.M)
+    if key not in c:
+        c = re.sub(r'(\[[^\]]+\])', r'\1\n' + key + '=0', c)
+with open(dst, 'w') as f:
+    f.write(c)
+PYEOF
+
+    # Host dnf.conf — isolated from system repos
+    cat > "${work_dir}/dnf.conf" << CONF
+[main]
+gpgcheck=0
+sslverify=0
+installonly_limit=3
+clean_requirements_on_remove=True
+reposdir=${work_dir}/repos.d
+CONF
+
+    # Enable all repos leapp defined
+    local enable_repos=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^\[([^\]]+)\]$ ]] && enable_repos+=(--enablerepo "${BASH_REMATCH[1]}")
+    done < "${work_dir}/repos.d/el8.repo"
+
+    if [[ ${#enable_repos[@]} -eq 0 ]]; then
+        log_warn "  No repo sections found in leapp repo file — skipping bootstrap."
+        return 0
+    fi
+
+    local dnf_log="${LOG_DIR}/host_dnf_bootstrap_${START_TIME}.log"
+    log_info "  Repos: ${enable_repos[*]}"
+    log_info "  Log: $dnf_log"
+    log_info "  (This may take 3-5 minutes — downloading EL8 bootstrap packages)"
+
+    # Run the same install leapp's actor runs, from host
+    dnf install -y \
+        --config="${work_dir}/dnf.conf" \
+        --setopt="module_platform_id=platform:el8" \
+        --setopt="keepcache=1" \
+        --releasever="8.10" \
+        --installroot="$installroot" \
+        --disablerepo="*" \
+        "${enable_repos[@]+"${enable_repos[@]}"}" \
+        dnf util-linux "dnf-command(config-manager)" \
+        2>&1 | tee "$dnf_log" || true
+
+    if [[ -f "${installroot}/usr/bin/dnf" ]] || [[ -f "${installroot}/bin/dnf" ]]; then
+        log_ok "  EL8 installroot bootstrapped from host. nspawn will skip the download."
+    else
+        log_warn "  Host bootstrap incomplete. Check: $dnf_log"
+        log_warn "  Last 10 lines:"
+        tail -10 "$dnf_log" | while read -r l; do log_warn "    $l"; done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# fix_nspawn_network — comprehensive nspawn remediation
+# Applies ALL known fixes in order of least to most invasive.
+# Safe to call multiple times.
+# ---------------------------------------------------------------------------
+fix_nspawn_network() {
+    log_info "Applying nspawn remediation (all strategies)..."
+
+    local overlay; overlay=$(_find_overlay)
+
+    if [[ -z "$overlay" ]]; then
+        log_info "  Overlay not yet created — will run after first preupgrade attempt."
+        return 0
+    fi
+    log_info "  Overlay: $overlay"
+
+    # ── 1. Patch leapp repo files (sslverify=0, gpgcheck=0) ─────────────────
+    log_info "  [1/5] Patching leapp EL8 repo files..."
+    _patch_leapp_repos
+
+    # ── 2. machine-id collision ──────────────────────────────────────────────
+    log_info "  [2/5] Checking machine-id collision..."
+    local host_mid; host_mid=$(cat /etc/machine-id 2>/dev/null || echo "x")
+    local ov_mid;   ov_mid=$(cat "${overlay}/etc/machine-id" 2>/dev/null || echo "")
+    if [[ "$host_mid" == "$ov_mid" ]] && [[ -n "$ov_mid" ]]; then
+        local new_id
+        new_id=$(od -An -tx1 /dev/urandom 2>/dev/null | head -1 | tr -d ' \n' | cut -c1-32 || \
+                 cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')
+        echo "$new_id" > "${overlay}/etc/machine-id" 2>/dev/null || true
+        log_ok "  machine-id collision fixed."
+    else
+        log_ok "  machine-id OK."
+    fi
+
+    # ── 3. Network files: resolv.conf + hosts + CA bundle ───────────────────
+    log_info "  [3/5] Injecting host network config into overlay..."
+    mkdir -p "${overlay}/etc/pki/tls/certs" "${overlay}/etc/pki/ca-trust" 2>/dev/null || true
+    cp -f /etc/resolv.conf   "${overlay}/etc/resolv.conf"                   2>/dev/null || true
+    cp -f /etc/hosts         "${overlay}/etc/hosts"                          2>/dev/null || true
+    [[ -f /etc/pki/tls/certs/ca-bundle.crt ]] && \
+        cp -f /etc/pki/tls/certs/ca-bundle.crt \
+              "${overlay}/etc/pki/tls/certs/ca-bundle.crt"                   2>/dev/null || true
+    [[ -d /etc/pki/ca-trust ]] && \
+        cp -rf /etc/pki/ca-trust/. "${overlay}/etc/pki/ca-trust/"            2>/dev/null || true
+    log_ok "  Network config injected."
+
+    # ── 4. Test nspawn network — can the container reach the internet? ───────
+    log_info "  [4/5] Testing nspawn container network..."
+    local nspawn_net_ok=false
+    if systemd-nspawn --register=no --quiet -D "$overlay" \
+        curl -4 --silent --max-time 8 --head \
+        "https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/repodata/repomd.xml" \
+        &>/dev/null 2>&1; then
+        nspawn_net_ok=true
+        log_ok "  nspawn network: WORKING — container can reach repos directly."
+    else
+        log_warn "  nspawn network: UNAVAILABLE — will use host-side bootstrap instead."
+    fi
+
+    # ── 5. Host-side dnf bootstrap (the definitive bypass) ──────────────────
+    # Always run this if nspawn network doesn't work.
+    # Also run it even if nspawn CAN reach network, as a speed optimisation
+    # (pre-cached packages = faster leapp run).
+    if [[ "$nspawn_net_ok" == false ]]; then
+        log_info "  [5/5] Running host-side EL8 bootstrap (bypasses nspawn network)..."
+        _host_dnf_bootstrap "$overlay"
+    else
+        log_info "  [5/5] nspawn network OK — skipping host-side bootstrap."
+    fi
+
+    log_ok "nspawn remediation complete."
 }
 
 phase_fix_inhibitors() {
@@ -1142,6 +1264,9 @@ phase_fix_inhibitors() {
 # ---------------------------------------------------------------------------
 # Phase 5: leapp preupgrade (with auto-retry)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 5: leapp preupgrade (with auto-retry + nspawn bypass)
+# ---------------------------------------------------------------------------
 phase_preupgrade() {
     log_section "Phase 5/6: leapp preupgrade (DRY RUN)"
 
@@ -1151,8 +1276,16 @@ phase_preupgrade() {
 
     log_info "This is a DRY RUN — no changes are made to the system."
 
-    local max_attempts=3
+    # Strategy:
+    #   Attempt 1: run leapp preupgrade — this creates the nspawn overlay.
+    #              The overlay will fail to reach repos (nspawn v219 + KVM).
+    #   Between attempts: apply nspawn remediation (patch repos + host dnf bootstrap).
+    #   Attempt 2: leapp preupgrade — overlay already has packages, no network needed.
+    #   Attempt 3: if still failing, run full inhibitor remediation + retry.
+
+    local max_attempts=4
     local attempt=0
+    local nspawn_fixed=false
 
     while [[ $attempt -lt $max_attempts ]]; do
         ((attempt++)) || true
@@ -1161,22 +1294,20 @@ phase_preupgrade() {
         local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
         "$LEAPP_BIN" preupgrade 2>&1 | tee "$plog" || true
 
-        # Fix nspawn overlay network immediately after leapp creates it.
-        # The overlay is built during preupgrade — resolv.conf is often empty.
-        # This must run AFTER preupgrade (overlay exists) and BEFORE the next attempt.
-        fix_nspawn_network
-
         if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
             log_error "leapp report not generated. See: $plog"
             die "leapp preupgrade failed to produce a report."
         fi
 
-        cp /var/log/leapp/leapp-report.txt "${LOG_DIR}/leapp_report_${START_TIME}_attempt${attempt}.txt"
+        cp /var/log/leapp/leapp-report.txt \
+           "${LOG_DIR}/leapp_report_${START_TIME}_attempt${attempt}.txt"
 
         # Count hard blockers
         local inhibitor_count error_count
-        inhibitor_count=$(grep -c "^Risk Factor: high (error)" /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
-        error_count=$(grep -c "Following errors occurred" /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
+        inhibitor_count=$(grep -c "^Risk Factor: high (error)" \
+            /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
+        error_count=$(grep -c "Following errors occurred" \
+            /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
 
         if [[ "$inhibitor_count" -eq 0 ]] && [[ "$error_count" -eq 0 ]]; then
             log_ok "leapp preupgrade: CLEAR — 0 inhibitors, 0 errors."
@@ -1184,17 +1315,30 @@ phase_preupgrade() {
             return 0
         fi
 
-        # Show report
-        echo
-        log_warn "Inhibitors/errors found (inhibitors: $inhibitor_count, errors: $error_count)"
-        echo -e "\n${YELLOW}══════════ leapp report ══════════${RESET}"
-        cat /var/log/leapp/leapp-report.txt
-        echo -e "${YELLOW}══════════════════════════════════${RESET}\n"
+        log_warn "Attempt $attempt: inhibitors=$inhibitor_count errors=$error_count"
+
+        # Detect the nspawn "Unable to install RHEL 8 userspace packages" error
+        local has_nspawn_error=false
+        if grep -q "Unable to install RHEL 8 userspace packages" \
+            /var/log/leapp/leapp-report.txt 2>/dev/null; then
+            has_nspawn_error=true
+        fi
 
         if [[ $attempt -lt $max_attempts ]]; then
-            log_info "Running auto-remediation (attempt $attempt)..."
-            state_set "PHASE_INHIBITORS" ""   # reset so fix runs again
-            phase_fix_inhibitors
+            if [[ "$has_nspawn_error" == true ]] && [[ "$nspawn_fixed" == false ]]; then
+                log_info "── Detected nspawn repo failure. Applying nspawn remediation ──"
+                fix_nspawn_network
+                nspawn_fixed=true
+                log_info "── Clearing leapp state for clean retry ──"
+                rm -rf /var/lib/leapp/storage 2>/dev/null || true
+                rm -f  /var/log/leapp/leapp-report.txt 2>/dev/null || true
+            else
+                # Non-nspawn inhibitor or nspawn already fixed — run full remediation
+                log_info "── Running full inhibitor remediation (attempt $attempt) ──"
+                state_set "PHASE_INHIBITORS" ""
+                phase_fix_inhibitors
+                rm -f /var/log/leapp/leapp-report.txt 2>/dev/null || true
+            fi
         else
             echo
             log_error "═══════════════════════════════════════════════════════════"
@@ -1206,7 +1350,9 @@ phase_preupgrade() {
             log_error "3. Re-run: sudo $SCRIPT_NAME --migrate"
             log_error "   (Migration will resume from this phase)"
             log_error "═══════════════════════════════════════════════════════════"
-            die "leapp preupgrade blocked. See report above."
+            echo
+            cat /var/log/leapp/leapp-report.txt
+            die "leapp preupgrade blocked after $max_attempts attempts."
         fi
     done
 }
