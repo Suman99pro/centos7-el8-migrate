@@ -43,6 +43,9 @@ readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
+# Resolved at runtime after leapp is installed
+LEAPP_BIN=""
+
 LOG_DIR="/var/log/el8-migration"
 LOG_FILE=""
 REPORT_FILE=""
@@ -864,6 +867,26 @@ prepare_system() {
 # ---------------------------------------------------------------------------
 # SECTION 4: ELEVATE / LEAPP UPGRADE
 # ---------------------------------------------------------------------------
+
+# Locate the leapp binary — it may be in /usr/bin, /bin, or /usr/local/bin
+resolve_leapp_bin() {
+    local candidates=(/usr/bin/leapp /bin/leapp /usr/local/bin/leapp)
+    for p in "${candidates[@]}"; do
+        if [[ -x "$p" ]]; then
+            LEAPP_BIN="$p"
+            log_ok "leapp binary found: $LEAPP_BIN"
+            return 0
+        fi
+    done
+    # Last resort: search PATH
+    if command -v leapp &>/dev/null 2>&1; then
+        LEAPP_BIN="$(command -v leapp)"
+        log_ok "leapp binary found via PATH: $LEAPP_BIN"
+        return 0
+    fi
+    die "leapp binary not found. Installation may have failed. Try: yum install -y leapp-upgrade"
+}
+
 install_elevate() {
     log_section "Installing ELevate (leapp-based upgrade tool)"
 
@@ -926,7 +949,7 @@ run_preupgrade_check() {
     log_section "Running leapp pre-upgrade analysis..."
 
     log_info "This performs a DRY RUN — no changes are made to the system."
-    leapp preupgrade 2>&1 | tee "${LOG_DIR}/leapp_preupgrade_${START_TIME}.log"
+    $LEAPP_BIN preupgrade 2>&1 | tee "${LOG_DIR}/leapp_preupgrade_${START_TIME}.log"
 
     echo
     log_info "Reviewing leapp pre-upgrade report..."
@@ -1000,7 +1023,7 @@ fix_leapp_inhibitors() {
         "verify_check_results.confirm=True"
     )
     for answer in "${leapp_answers[@]}"; do
-        leapp answer --section "$answer" 2>/dev/null &&             log_ok "  Answered: $answer" || true
+        $LEAPP_BIN answer --section "$answer" 2>/dev/null &&             log_ok "  Answered: $answer" || true
     done
 
     # -------------------------------------------------------------------------
@@ -1013,7 +1036,7 @@ fix_leapp_inhibitors() {
     # Run a quick preupgrade if report doesn't exist yet
     if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
         log_info "  No leapp report found yet — running initial preupgrade scan..."
-        leapp preupgrade 2>/dev/null || true
+        $LEAPP_BIN preupgrade 2>/dev/null || true
     fi
 
     if [[ -f /var/log/leapp/leapp-report.txt ]]; then
@@ -1176,8 +1199,8 @@ apply_leapp_answers() {
         cat "$answers_file"
     fi
 
-    leapp answer --section remove_pam_pkcs11_module_check.confirm=True 2>/dev/null || true
-    leapp answer --section authselect_check.confirm=True 2>/dev/null || true
+    $LEAPP_BIN answer --section remove_pam_pkcs11_module_check.confirm=True 2>/dev/null || true
+    $LEAPP_BIN answer --section authselect_check.confirm=True 2>/dev/null || true
 
     log_ok "leapp answers configured."
 }
@@ -1199,7 +1222,7 @@ run_upgrade() {
     echo
 
     # leapp upgrade initiates the process and reboots
-    leapp upgrade 2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log"
+    $LEAPP_BIN upgrade 2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log"
 
     log_info "leapp upgrade initiated. System will reboot automatically."
     log_info "After reboot, the upgrade will continue in the initramfs environment."
@@ -1594,6 +1617,7 @@ main() {
     # -----------------------------------------------------------------------
     log_section "PHASE 4: ELEVATE UPGRADE"
     install_elevate
+    resolve_leapp_bin
     fix_leapp_inhibitors
     run_preupgrade_check
     apply_leapp_answers
