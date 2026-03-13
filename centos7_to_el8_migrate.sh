@@ -868,8 +868,10 @@ prepare_system() {
 # SECTION 4: ELEVATE / LEAPP UPGRADE
 # ---------------------------------------------------------------------------
 
-# Locate the leapp binary — it may be in /usr/bin, /bin, or /usr/local/bin
+# Locate the leapp binary — tries known paths, PATH, full filesystem search,
+# and as a last resort attempts to install the missing leapp package.
 resolve_leapp_bin() {
+    # 1. Check known fixed paths first (fastest)
     local candidates=(/usr/bin/leapp /bin/leapp /usr/local/bin/leapp)
     for p in "${candidates[@]}"; do
         if [[ -x "$p" ]]; then
@@ -878,13 +880,57 @@ resolve_leapp_bin() {
             return 0
         fi
     done
-    # Last resort: search PATH
+
+    # 2. Check PATH
     if command -v leapp &>/dev/null 2>&1; then
         LEAPP_BIN="$(command -v leapp)"
         log_ok "leapp binary found via PATH: $LEAPP_BIN"
         return 0
     fi
-    die "leapp binary not found. Installation may have failed. Try: yum install -y leapp-upgrade"
+
+    # 3. Search entire filesystem (catches non-standard install paths)
+    log_warn "leapp not in standard paths — searching filesystem..."
+    local found
+    found=$(find /usr /bin /opt /usr/local -name "leapp" -type f -executable 2>/dev/null | head -1)
+    if [[ -n "$found" ]]; then
+        LEAPP_BIN="$found"
+        log_ok "leapp binary found via filesystem search: $LEAPP_BIN"
+        return 0
+    fi
+
+    # 4. Binary missing — the 'leapp' framework RPM was not installed
+    # This is the most common cause: only leapp-upgrade-el7toel8 was installed,
+    # not the 'leapp' package itself which provides the binary.
+    log_warn "leapp binary not found — attempting to install missing 'leapp' package..."
+    yum install -y leapp 2>&1 | tail -10 || true
+
+    # Re-check after install attempt
+    for p in /usr/bin/leapp /bin/leapp; do
+        if [[ -x "$p" ]]; then
+            LEAPP_BIN="$p"
+            log_ok "leapp binary available after install: $LEAPP_BIN"
+            return 0
+        fi
+    done
+    if command -v leapp &>/dev/null 2>&1; then
+        LEAPP_BIN="$(command -v leapp)"
+        log_ok "leapp binary available after install: $LEAPP_BIN"
+        return 0
+    fi
+
+    # 5. Completely failed — give detailed diagnostic
+    log_error "============================================================"
+    log_error "leapp binary could not be found or installed."
+    log_error "Diagnostic info:"
+    log_error "  rpm -qa | grep leapp:"
+    rpm -qa 2>/dev/null | grep -i leapp | while read -r p; do log_error "    $p"; done
+    log_error "  yum repolist | grep elevate:"
+    yum repolist all 2>/dev/null | grep -i elevate | while read -r l; do log_error "    $l"; done
+    log_error "Manual fix:"
+    log_error "  yum-config-manager --enable elevate"
+    log_error "  yum install -y leapp"
+    log_error "============================================================"
+    die "Cannot proceed without leapp binary."
 }
 
 install_elevate() {
@@ -958,8 +1004,10 @@ install_elevate() {
     if [[ -z "$leapp_bin" ]]; then
         die "leapp binary still not found after installation. Check: rpm -ql leapp"
     fi
-    log_ok "leapp binary confirmed at: $leapp_bin"
-    log_ok "ELevate/leapp fully installed."
+    log_ok "ELevate packages installed."
+
+    # Resolve and set LEAPP_BIN immediately so all subsequent functions can use it
+    resolve_leapp_bin
 }
 
 run_preupgrade_check() {
@@ -1634,7 +1682,8 @@ main() {
     # -----------------------------------------------------------------------
     log_section "PHASE 4: ELEVATE UPGRADE"
     install_elevate
-    resolve_leapp_bin
+    # Note: resolve_leapp_bin is called inside install_elevate above
+    # LEAPP_BIN is now set and ready
     fix_leapp_inhibitors
     run_preupgrade_check
     apply_leapp_answers
