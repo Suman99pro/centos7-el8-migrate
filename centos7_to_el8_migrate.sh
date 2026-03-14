@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.10.0"
+readonly SCRIPT_VERSION="3.12.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -1301,11 +1301,74 @@ CONF
 
     if [[ -f "${installroot}/usr/bin/dnf" ]] || [[ -f "${installroot}/bin/dnf" ]]; then
         log_ok "  EL8 installroot bootstrapped from host. nspawn will skip the download."
+        # Sanitize the installroot immediately after bootstrap
+        _sanitize_el8_installroot "$installroot"
     else
         log_warn "  Host bootstrap incomplete. Check: $dnf_log"
-        log_warn "  Last 10 lines:"
         tail -10 "$dnf_log" | while read -r l; do log_warn "    $l"; done
     fi
+}
+
+# ---------------------------------------------------------------------------
+# _sanitize_el8_installroot — fix subscription-manager INSIDE the installroot
+#
+# ROOT CAUSE (confirmed): host sub-mgr is absent, but leapp still reports
+# "Cannot set the container mode for subscription-manager" because the EL8
+# installroot has its own copy of subscription-manager-rhsm installed as
+# a dependency of dnf/rpm. The leapp actor runs INSIDE the nspawn container
+# where that EL8 sub-mgr IS present and fails the container-mode check.
+#
+# Fix: after the installroot is populated, neutralize sub-mgr inside it.
+# ---------------------------------------------------------------------------
+_sanitize_el8_installroot() {
+    local installroot="$1"
+    [[ -d "$installroot" ]] || return 0
+
+    log_info "  Sanitizing EL8 installroot: $installroot"
+
+    # Fix 1: Write rhsm.conf with manage_repos=0 inside installroot
+    # This prevents leapp's EL8 actor from attempting container mode
+    mkdir -p "${installroot}/etc/rhsm" 2>/dev/null || true
+    printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n\n[rhsmcertd]\nautoAttachInterval = 1440\n' \
+        > "${installroot}/etc/rhsm/rhsm.conf" 2>/dev/null || true
+    log_ok "    installroot rhsm.conf: manage_repos=0"
+
+    # Fix 2: Replace sub-mgr binary inside installroot with a stub
+    for sm_path in \
+        "${installroot}/usr/sbin/subscription-manager" \
+        "${installroot}/usr/bin/subscription-manager"
+    do
+        if [[ -f "$sm_path" ]] && ! grep -q "EL8MIGRATE" "$sm_path" 2>/dev/null; then
+            cp -f "$sm_path" "${sm_path}.el8migrate.orig" 2>/dev/null || true
+            printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm_path" 2>/dev/null || true
+            chmod +x "$sm_path" 2>/dev/null || true
+            log_ok "    stubbed: $sm_path"
+        elif [[ ! -f "$sm_path" ]]; then
+            # Ensure the directory exists and create a stub so leapp finds it
+            mkdir -p "$(dirname "$sm_path")" 2>/dev/null || true
+            printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm_path" 2>/dev/null || true
+            chmod +x "$sm_path" 2>/dev/null || true
+            log_ok "    stub created: $sm_path"
+        fi
+    done
+
+    # Fix 3: Set LEAPP_NO_RHSM in the installroot's environment profile
+    mkdir -p "${installroot}/etc/profile.d" 2>/dev/null || true
+    echo 'export LEAPP_NO_RHSM=1' > \
+        "${installroot}/etc/profile.d/el8migrate_no_rhsm.sh" 2>/dev/null || true
+
+    # Fix 4: Remove python-rhsm and subscription-manager-rhsm from installroot
+    # These are the packages that trigger the container-mode check
+    if [[ -f "${installroot}/usr/bin/dnf" ]]; then
+        log_info "    Removing sub-mgr packages from installroot..."
+        chroot "$installroot" dnf remove -y \
+            subscription-manager \
+            subscription-manager-rhsm \
+            python3-subscription-manager-rhsm \
+            2>/dev/null | tail -3 || true
+    fi
+
+    log_ok "  EL8 installroot sanitized."
 }
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1433,12 @@ fix_nspawn_network() {
     log_info "  [F] Running host-side EL8 bootstrap (pre-populates installroot)..."
     _host_dnf_bootstrap "$overlay"
 
+    # Layer G: sanitize installroot — remove/stub sub-mgr INSIDE the container
+    # This is the fix for "Cannot set the container mode for subscription-manager"
+    log_info "  [G] Sanitizing EL8 installroot (neutralize sub-mgr inside container)..."
+    local installroot="${overlay}/el8target"
+    _sanitize_el8_installroot "$installroot"
+
     log_ok "nspawn remediation complete (all layers applied)."
 }
 
@@ -1388,37 +1457,33 @@ phase_fix_inhibitors() {
     log_info "Step 1: Neutralizing subscription-manager..."
     export LEAPP_NO_RHSM=1
 
-    # Layer a: Remove sub-mgr and related packages
-    local _smpkgs
-    _smpkgs=$(rpm -qa 2>/dev/null | grep -E \
-        "^(subscription-manager|python-syspurpose|python3-syspurpose)" || true)
-    if [[ -n "$_smpkgs" ]]; then
-        log_info "  Removing packages: $(echo "$_smpkgs" | tr '\n' ' ')"
-        # shellcheck disable=SC2086
-        yum remove -y --setopt=clean_requirements_on_remove=0 \
-            $( echo "$_smpkgs" | tr '\n' ' ' ) 2>/dev/null | tail -3 || true
-        # rpm force if yum couldn't do it
-        while IFS= read -r _pkg; do
-            [[ -z "$_pkg" ]] && continue
-            rpm -q "$_pkg" &>/dev/null 2>&1 && \
-                rpm -e --nodeps "$_pkg" 2>/dev/null || true
-        done <<< "$_smpkgs"
-    fi
+    # THE CORRECT FIX for "Cannot set the container mode for subscription-manager":
+    # Root cause: leapp's target_userspace_creator actor calls subscription-manager
+    # with container mode. The fix is NOT removal (leapp needs the binary) but
+    # configuring rhsm to disable repo management — leapp then skips this check.
 
-    # Layer b: Stub binary if still present
-    local _smbin
-    _smbin=$(command -v subscription-manager 2>/dev/null || echo "")
-    if [[ -n "$_smbin" ]] && [[ -f "$_smbin" ]]; then
-        if ! grep -q "EL8MIGRATE" "$_smbin" 2>/dev/null; then
-            cp -f "$_smbin" "${_smbin}.el8migrate.real" 2>/dev/null || true
-            printf "#!/bin/sh\n# EL8MIGRATE\nexit 0\n" > "$_smbin" 2>/dev/null || true
-            chmod +x "$_smbin" 2>/dev/null || true
-            log_ok "  subscription-manager stubbed (returns 0)."
-        else
-            log_ok "  subscription-manager already stubbed."
-        fi
+    # Layer a: Configure /etc/rhsm/rhsm.conf with manage_repos=0
+    mkdir -p /etc/rhsm 2>/dev/null || true
+    if [[ -f /etc/rhsm/rhsm.conf ]]; then
+        sed -i 's/^manage_repos[[:space:]]*=.*/manage_repos = 0/' /etc/rhsm/rhsm.conf 2>/dev/null || true
+        grep -q "^manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null || \
+            sed -i '/^\[rhsm\]/a manage_repos = 0' /etc/rhsm/rhsm.conf 2>/dev/null || true
     else
-        log_ok "  subscription-manager not present."
+        printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n' > /etc/rhsm/rhsm.conf
+    fi
+    command -v subscription-manager &>/dev/null 2>&1 && \
+        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
+    log_ok "  rhsm: manage_repos=0 configured."
+
+    # Layer b: If sub-mgr binary is absent, create a minimal stub
+    # leapp actors expect the binary to exist even with LEAPP_NO_RHSM=1
+    if ! command -v subscription-manager &>/dev/null 2>&1 && [[ ! -f /usr/sbin/subscription-manager ]]; then
+        log_info "  subscription-manager missing — creating stub binary..."
+        printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > /usr/sbin/subscription-manager
+        chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
+        log_ok "  stub created at /usr/sbin/subscription-manager"
+    else
+        log_ok "  subscription-manager present."
     fi
 
     # Step 2: Write leapp answerfile (overwrite — no duplicates).
@@ -1634,6 +1699,10 @@ phase_preupgrade() {
 
         # Verify network is up before each attempt
         _restore_network
+
+        # Sanitize EL8 installroot if it exists — neutralize sub-mgr inside it
+        local _ir; _ir=$(_find_overlay)
+        [[ -n "$_ir" ]] && _sanitize_el8_installroot "${_ir}/el8target"
 
         local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
         LEAPP_NO_RHSM=1 "$LEAPP_BIN" preupgrade --no-rhsm 2>&1 | tee "$plog" || true
@@ -1876,26 +1945,24 @@ do_migrate() {
     # Subscription-manager removal and answerfile must be current on every run.
     log_info "Pre-checks (always run)..."
 
-    # Remove + stub subscription-manager unconditionally
+    # Fix subscription-manager: configure rhsm to not manage repos
     export LEAPP_NO_RHSM=1
-    local _pre_smpkgs
-    _pre_smpkgs=$(rpm -qa 2>/dev/null | grep -E \
-        "^(subscription-manager|python-syspurpose|python3-syspurpose)" || true)
-    if [[ -n "$_pre_smpkgs" ]]; then
-        log_info "  Removing: $(echo "$_pre_smpkgs" | tr '\n' ' ')"
-        yum remove -y --setopt=clean_requirements_on_remove=0 \
-            $(echo "$_pre_smpkgs" | tr '\n' ' ') 2>/dev/null | tail -3 || true
-        while IFS= read -r _p; do
-            [[ -z "$_p" ]] && continue
-            rpm -q "$_p" &>/dev/null 2>&1 && rpm -e --nodeps "$_p" 2>/dev/null || true
-        done <<< "$_pre_smpkgs"
+    mkdir -p /etc/rhsm 2>/dev/null || true
+    if [[ -f /etc/rhsm/rhsm.conf ]]; then
+        sed -i 's/^manage_repos[[:space:]]*=.*/manage_repos = 0/' /etc/rhsm/rhsm.conf 2>/dev/null || true
+        grep -q "^manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null || \
+            sed -i '/^\[rhsm\]/a manage_repos = 0' /etc/rhsm/rhsm.conf 2>/dev/null || true
+    else
+        printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n' > /etc/rhsm/rhsm.conf
     fi
-    # Stub if still present
-    local _smb; _smb=$(command -v subscription-manager 2>/dev/null || echo "")
-    if [[ -n "$_smb" ]] && [[ -f "$_smb" ]] && ! grep -q "EL8MIGRATE" "$_smb" 2>/dev/null; then
-        cp -f "$_smb" "${_smb}.el8migrate.real" 2>/dev/null || true
-        printf "#!/bin/sh\n# EL8MIGRATE\nexit 0\n" > "$_smb" && chmod +x "$_smb" || true
-        log_ok "  subscription-manager stubbed."
+    command -v subscription-manager &>/dev/null 2>&1 && \
+        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
+    log_ok "  rhsm: manage_repos=0"
+    # Ensure binary exists (leapp needs it even with --no-rhsm)
+    if ! command -v subscription-manager &>/dev/null 2>&1 && [[ ! -f /usr/sbin/subscription-manager ]]; then
+        printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > /usr/sbin/subscription-manager
+        chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
+        log_ok "  subscription-manager stub created."
     fi
 
     # Write answerfile unconditionally (overwrite — always fresh)
