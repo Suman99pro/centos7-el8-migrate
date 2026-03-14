@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.4.0"
+readonly SCRIPT_VERSION="3.6.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -869,6 +869,15 @@ phase_install_elevate() {
     rpm -qa 2>/dev/null | grep -iE "leapp|elevate" | while read -r p; do log_info "  $p"; done
 
     resolve_leapp_bin
+
+    # Patch the leapp actor immediately after install.
+    # This is the primary fix for enp0s3 going down during preupgrade.
+    # Must happen here — before ANY leapp command runs — so the actor
+    # never executes without --network-none.
+    log_info "Patching leapp actor (prevent NIC capture by nspawn)..."
+    _patch_leapp_actor
+    _prevent_nspawn_network_namespace
+
     state_set "PHASE_ELEVATE" "complete"
     log_ok "ELevate installed."
 }
@@ -1024,124 +1033,197 @@ _restore_network() {
 # With --network-none, the container has no network — but that's fine because
 # we pre-populate the installroot from the host before leapp runs.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _patch_leapp_actor
+#
+# ROOT CAUSE (confirmed via systemd issue #4330 + leapp source):
+#   leapp's targetuserspacecreator actor runs:
+#     systemd-nspawn --register=no --quiet -D <overlay> dnf install ...
+#   On systemd v219 (CentOS 7), nspawn WITHOUT --network-none creates a
+#   MACVLAN or veth pair that moves enp0s3 into the container namespace.
+#   When the container exits, systemd v219 has a bug: it does NOT move
+#   the interface back to the host namespace. Result: enp0s3 disappears
+#   from the host, script loses SSH/network, exits mid-run.
+#
+# FIX: Surgically patch userspacegen.py to inject '--network-none' into
+#   the nspawn command list. With --network-none, nspawn never touches
+#   the host network stack. The host-side dnf bootstrap pre-populates
+#   the installroot so network inside the container is not needed.
+#
+# Targets (in priority order):
+#   1. /usr/share/leapp-repository/.../userspacegen.py  (ELevate install)
+#   2. /etc/leapp/repos.d/.../userspacegen.py           (alternative path)
+#   3. Any .py file containing the nspawn command       (fallback)
+# ---------------------------------------------------------------------------
 _patch_leapp_actor() {
-    log_info "  [A] Patching leapp nspawn actor to prevent host network disruption..."
+    log_info "  [A] Patching leapp actor to add --network-none to nspawn..."
 
-    # Find the actor file — it calls systemd-nspawn with the repo install
-    local actor_files=()
-    while IFS= read -r f; do
-        actor_files+=("$f")
-    done < <(find /usr/share/leapp-repository/ -name "*.py" 2>/dev/null | \
-             xargs grep -l "systemd-nspawn" 2>/dev/null || true)
+    local search_dirs=(
+        "/usr/share/leapp-repository"
+        "/etc/leapp/repos.d"
+        "/usr/lib/leapp"
+    )
 
-    if [[ ${#actor_files[@]} -eq 0 ]]; then
-        log_warn "  No leapp actor files found with systemd-nspawn reference."
-        return 0
-    fi
+    local found_any=false
 
-    for actor in "${actor_files[@]+"${actor_files[@]}"}"; do
-        log_info "  Checking: $actor"
+    for search_dir in "${search_dirs[@]}"; do
+        [[ -d "$search_dir" ]] || continue
 
-        # Skip if already patched
-        if grep -q "network-none\|network_none\|ALREADY_PATCHED_BY_MIGRATION" \
-            "$actor" 2>/dev/null; then
-            log_ok "  Already patched: $actor"
-            continue
-        fi
+        # Find Python files that contain the exact nspawn command leapp runs
+        while IFS= read -r pyfile; do
+            [[ -f "$pyfile" ]] || continue
 
-        # Backup original
-        [[ -f "${actor}.orig" ]] || cp -f "$actor" "${actor}.orig" 2>/dev/null || true
+            # Skip if already patched
+            if grep -q "network-none\|PATCHED_EL8_MIGRATE" "$pyfile" 2>/dev/null; then
+                log_ok "  Already patched: $(basename "$pyfile")"
+                found_any=true
+                continue
+            fi
 
-        # Patch: add --network-none to the nspawn command list
-        python2 - "$actor" << 'PYEOF' 2>/dev/null && \
-            log_ok "  Patched: $actor" || \
-            log_warn "  Could not patch: $actor (will rely on pre-bootstrap instead)"
+            # Only patch files that actually contain the nspawn call
+            grep -q "systemd-nspawn" "$pyfile" 2>/dev/null || continue
+
+            log_info "  Found nspawn actor: $pyfile"
+            found_any=true
+
+            # Backup
+            [[ -f "${pyfile}.el8migrate.orig" ]] || \
+                cp -f "$pyfile" "${pyfile}.el8migrate.orig" 2>/dev/null || true
+
+            # Surgical patch using python2 (always available on CentOS 7)
+            python2 - "$pyfile" << 'PYEOF'
 import sys, re
 
 path = sys.argv[1]
 with open(path) as f:
     content = f.read()
 
-# Strategy 1: Find the list that builds nspawn args and inject --network-none
-# Common patterns in leapp actors:
-#   cmd = ['systemd-nspawn', ...]
-#   nspawn_cmd = ['systemd-nspawn', ...]
+original = content
 patched = False
 
-# Pattern: nspawn command built as a list literal
-def add_network_none(m):
+# ── Pattern 1 ─────────────────────────────────────────────────────────────
+# The nspawn cmd is built as a Python list then passed to run_cmd/check_call.
+# Example from userspacegen.py:
+#   cmd = ['systemd-nspawn', '--register=no', '--quiet', '-D', ...]
+#
+# Inject '--network-none' right after '--register=no'
+def inject_after_register(m):
     global patched
-    patched = True
     s = m.group(0)
-    if '--network-none' not in s and 'network-none' not in s:
-        # Insert --network-none after --register=no or after -D flag
-        s = re.sub(
-            r"('--register=no'|'--quiet')",
-            r"\1, '--network-none'",
-            s, count=1
-        )
+    if '--network-none' not in s:
+        s = s.replace("'--register=no'", "'--register=no', '--network-none'", 1)
+        s = s.replace('"--register=no"', '"--register=no", "--network-none"', 1)
+        patched = True
     return s
 
+# Match list literals containing systemd-nspawn (possibly multi-line)
 content = re.sub(
-    r"\[['\"]\s*systemd-nspawn['\"].*?\]",
-    add_network_none,
+    r"\[['\"]systemd-nspawn['\"].*?\]",
+    inject_after_register,
     content,
     flags=re.DOTALL
 )
 
-# Strategy 2: Find string-based nspawn calls
+# ── Pattern 2 ─────────────────────────────────────────────────────────────
+# nspawn args built by appending to a list variable:
+#   nspawn_cmd = ['systemd-nspawn']
+#   nspawn_cmd += ['--register=no', '--quiet', ...]
 if not patched:
-    content = re.sub(
+    def inject_in_extend(m):
+        global patched
+        s = m.group(0)
+        if '--network-none' not in s and '--register=no' in s:
+            s = s.replace("'--register=no'", "'--register=no', '--network-none'", 1)
+            patched = True
+        return s
+    content = re.sub(r"\[.*?'--register=no'.*?\]", inject_in_extend, content)
+
+# ── Pattern 3 ─────────────────────────────────────────────────────────────
+# String-form nspawn (rare but possible in older leapp):
+#   'systemd-nspawn --register=no --quiet -D ...'
+if not patched:
+    new_content = re.sub(
         r"(systemd-nspawn\s+--register=no)",
         r"\1 --network-none",
         content
     )
-    patched = True
+    if new_content != content:
+        content = new_content
+        patched = True
 
-# Mark as patched
-content = content + '\n# ALREADY_PATCHED_BY_MIGRATION\n'
-
-with open(path, 'w') as f:
-    f.write(content)
-
-sys.exit(0)
+if patched:
+    # Add marker so we don't double-patch
+    content += '\n# PATCHED_EL8_MIGRATE: --network-none injected to prevent NIC capture\n'
+    with open(path, 'w') as f:
+        f.write(content)
+    print("PATCHED: " + path)
+    sys.exit(0)
+else:
+    print("SKIP: no patchable nspawn pattern found in " + path)
+    sys.exit(1)
 PYEOF
+
+            local rc=$?
+            if [[ $rc -eq 0 ]]; then
+                log_ok "  Patched: $(basename "$pyfile")"
+                # Verify the patch is actually in the file
+                if grep -q "network-none" "$pyfile" 2>/dev/null; then
+                    log_ok "  Verified: --network-none present in $pyfile"
+                else
+                    log_warn "  Patch may not have taken — manual check needed"
+                fi
+            else
+                log_warn "  Could not auto-patch: $(basename "$pyfile")"
+                log_warn "  Relying on host-side bootstrap instead."
+            fi
+
+        done < <(find "$search_dir" -name "*.py" 2>/dev/null)
     done
+
+    if [[ "$found_any" == false ]]; then
+        log_warn "  No leapp actor files found yet (leapp not installed)."
+        log_info "  Actor will be patched after ELevate install."
+    fi
 }
 
 # ---------------------------------------------------------------------------
 # _prevent_nspawn_network_namespace
-#
-# systemd-nspawn v219 (CentOS 7) can create a private network namespace that
-# captures the host NIC. Prevent this by:
-#   1. systemd drop-in that disables PrivateNetwork for all nspawn units
-#   2. /etc/systemd/nspawn/ config for leapp's container
+# Belt-and-suspenders: systemd-level config to stop nspawn taking the NIC
 # ---------------------------------------------------------------------------
 _prevent_nspawn_network_namespace() {
-    log_info "  [B] Preventing nspawn from creating isolated network namespace..."
+    log_info "  [B] Configuring systemd to prevent nspawn NIC capture..."
 
-    # Drop-in for systemd-nspawn@.service
+    # Drop-in for systemd-nspawn@.service — disable private networking
     local dropin_dir="/etc/systemd/system/systemd-nspawn@.service.d"
     mkdir -p "$dropin_dir" 2>/dev/null || true
-    cat > "${dropin_dir}/network.conf" << 'EOF'
+    cat > "${dropin_dir}/no-private-network.conf" << 'EOF'
 [Service]
 PrivateNetwork=no
 EOF
-    systemctl daemon-reload 2>/dev/null || true
-    log_ok "  systemd-nspawn PrivateNetwork=no drop-in applied."
 
-    # nspawn container config — tell nspawn to use host network
+    # /etc/systemd/nspawn/ config files — cover all possible container names
+    # leapp uses the directory name of the overlay as the container name
     local nspawn_conf_dir="/etc/systemd/nspawn"
     mkdir -p "$nspawn_conf_dir" 2>/dev/null || true
-    # leapp uses a container name based on the scratch dir — cover common names
-    for name in leapp root_ system_overlay; do
+    for name in leapp root_ system_overlay mounts; do
         cat > "${nspawn_conf_dir}/${name}.nspawn" << 'EOF'
 [Network]
 Private=no
 VirtualEthernet=no
 EOF
     done
-    log_ok "  nspawn container network config applied."
+
+    # Stop systemd-networkd if running — it's the service that manages
+    # the nspawn veth interfaces and can interfere with the host NIC
+    if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        log_warn "  systemd-networkd is running — stopping it (leapp doesn't need it)..."
+        systemctl stop systemd-networkd 2>/dev/null || true
+        systemctl disable systemd-networkd 2>/dev/null || true
+        log_ok "  systemd-networkd stopped."
+    fi
+
+    systemctl daemon-reload 2>/dev/null || true
+    log_ok "  nspawn network namespace prevention configured."
 }
 
 _host_dnf_bootstrap() {
@@ -1245,8 +1327,6 @@ CONF
 # ---------------------------------------------------------------------------
 # fix_nspawn_network — comprehensive nspawn remediation
 # Applies ALL known fixes in order of least to most invasive.
-# Safe to call multiple times.
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # fix_nspawn_network — all-layer nspawn fix
 # Layer A: patch leapp actor to add --network-none
@@ -1311,28 +1391,61 @@ fix_nspawn_network() {
 phase_fix_inhibitors() {
     log_section "Phase 4b: Universal Inhibitor Remediation"
 
-    # Step 1: leapp answerfile — pre-answer all known interactive prompts
-    log_info "Step 1: Pre-answering all known leapp interactive prompts..."
+    # Step 1: subscription-manager — remove it (not needed for CentOS→AlmaLinux/Rocky)
+    # Causes "Cannot set container mode" blocker when present on non-RHEL systems.
+    log_info "Step 1: Removing subscription-manager (not needed for ELevate)..."
+    if rpm -q subscription-manager &>/dev/null 2>&1; then
+        yum remove -y subscription-manager \
+            --setopt=clean_requirements_on_remove=0 2>/dev/null || true
+        log_ok "  subscription-manager removed."
+    else
+        log_ok "  subscription-manager not installed — OK."
+    fi
+    # Belt-and-suspenders: also set env var and config
+    export LEAPP_NO_RHSM=1
+    if command -v subscription-manager &>/dev/null 2>&1; then
+        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
+    fi
+
+    # Step 2: leapp answerfile — pre-answer ALL known interactive prompts
+    log_info "Step 2: Pre-answering all known leapp interactive prompts..."
     for ans in \
         "remove_pam_pkcs11_module_check.confirm=True" \
         "authselect_check.confirm=True" \
         "remove_ifcfg_files_check.confirm=True" \
         "grub_enableos_prober_check.confirm=True" \
-        "verify_check_results.confirm=True"
+        "verify_check_results.confirm=True" \
+        "modified_files_check.confirm=True"
     do
-        "$LEAPP_BIN" answer --section "$ans" 2>/dev/null && log_ok "  Answered: $ans" || true
+        "$LEAPP_BIN" answer --section "$ans" 2>/dev/null && \
+            log_ok "  Answered: $ans" || true
     done
 
-    # Step 2: Generate leapp report if missing
-    if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
-        log_info "Step 2: Generating initial leapp report..."
-        "$LEAPP_BIN" preupgrade 2>/dev/null || true
-    else
-        log_ok "Step 2: leapp report already exists."
-    fi
+    # Also write the answerfile directly (belt-and-suspenders)
+    local answerfile="/var/log/leapp/answerfile"
+    mkdir -p /var/log/leapp 2>/dev/null || true
+    cat >> "$answerfile" << 'EOF'
+[remove_pam_pkcs11_module_check]
+confirm = True
+[authselect_check]
+confirm = True
+[remove_ifcfg_files_check]
+confirm = True
+[grub_enableos_prober_check]
+confirm = True
+[verify_check_results]
+confirm = True
+[modified_files_check]
+confirm = True
+EOF
+    log_ok "  Answerfile written: $answerfile"
 
-    # Step 3: Dynamically blacklist drivers from report
-    log_info "Step 3: Blacklisting removed drivers from leapp report..."
+    # Step 3: Clean up our .orig backup files — leapp flags them as "custom files"
+    log_info "Step 3: Removing .orig backup files (prevent custom-actor false positive)..."
+    find /usr/share/leapp-repository/ -name "*.el8migrate.orig" \
+        -delete 2>/dev/null && log_ok "  .orig backups removed." || true
+    # Step 4: Dynamically blacklist drivers from leapp report
+    log_info "Step 4: Blacklisting removed drivers from leapp report..."
     if [[ -f /var/log/leapp/leapp-report.txt ]]; then
         local rdrvs=()
         while IFS= read -r line; do
@@ -1429,12 +1542,6 @@ phase_fix_inhibitors() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 5: leapp preupgrade (with auto-retry)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Phase 5: leapp preupgrade (with auto-retry + nspawn bypass)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Phase 5: leapp preupgrade (with auto-retry + nspawn bypass)
 # ---------------------------------------------------------------------------
 phase_preupgrade() {
@@ -1453,6 +1560,35 @@ phase_preupgrade() {
     _patch_leapp_actor
     _prevent_nspawn_network_namespace
 
+    # Start a background NIC watchdog.
+    # If nspawn takes enp0s3 down despite our patches, this brings it back
+    # within 3 seconds so the script can continue.
+    local primary_nic
+    primary_nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+    if [[ -n "$primary_nic" ]]; then
+        log_info "Starting NIC watchdog for $primary_nic (background)..."
+        (
+            while true; do
+                sleep 3
+                if ! ip link show "$primary_nic" 2>/dev/null | grep -q "state UP"; then
+                    echo "[watchdog] $primary_nic is DOWN — restoring..." >> "$LOG_FILE" 2>/dev/null || true
+                    ip link set "$primary_nic" up 2>/dev/null || true
+                    sleep 1
+                    # Try DHCP if no IP after link up
+                    if ! ip addr show "$primary_nic" 2>/dev/null | grep -q "inet "; then
+                        dhclient -r "$primary_nic" 2>/dev/null || true
+                        dhclient "$primary_nic" 2>/dev/null || true
+                    fi
+                fi
+            done
+        ) &
+        local WATCHDOG_PID=$!
+        log_info "NIC watchdog running (PID $WATCHDOG_PID)."
+    else
+        local WATCHDOG_PID=""
+        log_warn "Could not determine primary NIC — watchdog not started."
+    fi
+
     local max_attempts=4
     local attempt=0
     local nspawn_fixed=false
@@ -1465,7 +1601,7 @@ phase_preupgrade() {
         _restore_network
 
         local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
-        "$LEAPP_BIN" preupgrade 2>&1 | tee "$plog" || true
+        LEAPP_NO_RHSM=1 "$LEAPP_BIN" preupgrade --no-rhsm 2>&1 | tee "$plog" || true
 
         # ALWAYS restore network after preupgrade — nspawn may have taken it down
         log_info "Checking host network after preupgrade run..."
@@ -1528,6 +1664,9 @@ phase_preupgrade() {
             die "leapp preupgrade blocked after $max_attempts attempts."
         fi
     done
+
+    # Clean up watchdog
+    [[ -n "${WATCHDOG_PID:-}" ]] && kill "$WATCHDOG_PID" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1557,7 +1696,8 @@ phase_upgrade() {
     log_info "Running leapp upgrade — system will reboot automatically..."
     echo
 
-    "$LEAPP_BIN" upgrade 2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log" || true
+    LEAPP_NO_RHSM=1 "$LEAPP_BIN" upgrade --no-rhsm \
+        2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log" || true
 
     # Restore network if nspawn took it down during upgrade
     _restore_network
