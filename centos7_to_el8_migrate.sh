@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.8.0"
+readonly SCRIPT_VERSION="3.9.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -1376,59 +1376,69 @@ fix_nspawn_network() {
 phase_fix_inhibitors() {
     log_section "Phase 4b: Universal Inhibitor Remediation"
 
-    # Step 1: subscription-manager — remove it (not needed for CentOS→AlmaLinux/Rocky)
-    # Causes "Cannot set container mode" blocker when present on non-RHEL systems.
-    log_info "Step 1: Removing subscription-manager (not needed for ELevate)..."
+    # Steps 1-3 run unconditionally on EVERY call (idempotent, cheap).
+    # Critical: these must run even when resuming from a saved state.
+
+    # Step 1: Remove subscription-manager — causes hard blocker on non-RHEL.
+    log_info "Step 1: Removing subscription-manager..."
     if rpm -q subscription-manager &>/dev/null 2>&1; then
         yum remove -y subscription-manager \
-            --setopt=clean_requirements_on_remove=0 2>/dev/null || true
-        log_ok "  subscription-manager removed."
+            --setopt=clean_requirements_on_remove=0 2>/dev/null | tail -3 || true
+        # Force remove if yum failed
+        rpm -q subscription-manager &>/dev/null 2>&1 && \
+            rpm -e --nodeps subscription-manager 2>/dev/null || true
+        rpm -q subscription-manager &>/dev/null 2>&1 && \
+            log_warn "  Could not remove subscription-manager!" || \
+            log_ok "  subscription-manager removed."
     else
-        log_ok "  subscription-manager not installed — OK."
+        log_ok "  subscription-manager not installed."
     fi
-    # Belt-and-suspenders: also set env var and config
     export LEAPP_NO_RHSM=1
-    if command -v subscription-manager &>/dev/null 2>&1; then
-        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
-    fi
 
-    # Step 2: leapp answerfile — pre-answer ALL known interactive prompts
-    log_info "Step 2: Pre-answering all known leapp interactive prompts..."
-    for ans in \
-        "remove_pam_pkcs11_module_check.confirm=True" \
-        "authselect_check.confirm=True" \
-        "remove_ifcfg_files_check.confirm=True" \
-        "grub_enableos_prober_check.confirm=True" \
-        "verify_check_results.confirm=True" \
-        "modified_files_check.confirm=True"
-    do
-        "$LEAPP_BIN" answer --section "$ans" 2>/dev/null && \
-            log_ok "  Answered: $ans" || true
-    done
-
-    # Also write the answerfile directly (belt-and-suspenders)
-    local answerfile="/var/log/leapp/answerfile"
+    # Step 2: Write leapp answerfile (overwrite — no duplicates).
+    log_info "Step 2: Writing leapp answerfile..."
     mkdir -p /var/log/leapp 2>/dev/null || true
-    cat >> "$answerfile" << 'EOF'
+    cat > /var/log/leapp/answerfile << 'ANSEOF'
 [remove_pam_pkcs11_module_check]
 confirm = True
+
 [authselect_check]
 confirm = True
+
 [remove_ifcfg_files_check]
 confirm = True
+
 [grub_enableos_prober_check]
 confirm = True
+
 [verify_check_results]
 confirm = True
+
 [modified_files_check]
 confirm = True
-EOF
-    log_ok "  Answerfile written: $answerfile"
 
-    # Step 3: Clean up our .orig backup files — leapp flags them as "custom files"
-    log_info "Step 3: Removing .orig backup files (prevent custom-actor false positive)..."
+[check_custom_actors]
+confirm = True
+ANSEOF
+    log_ok "  Answerfile written: /var/log/leapp/answerfile"
+    # Belt-and-suspenders: also use leapp answer command
+    if [[ -n "${LEAPP_BIN:-}" ]]; then
+        for ans in \
+            "remove_pam_pkcs11_module_check.confirm=True" \
+            "authselect_check.confirm=True" \
+            "verify_check_results.confirm=True" \
+            "modified_files_check.confirm=True"
+        do
+            "$LEAPP_BIN" answer --section "$ans" 2>/dev/null || true
+        done
+    fi
+
+    # Step 3: Remove .orig backup files (leapp flags as custom actors)
+    log_info "Step 3: Removing .orig backup files..."
     find /usr/share/leapp-repository/ -name "*.el8migrate.orig" \
-        -delete 2>/dev/null && log_ok "  .orig backups removed." || true
+        -delete 2>/dev/null || true
+    log_ok "  .orig backups removed."
+
     # Step 4: Dynamically blacklist drivers from leapp report
     log_info "Step 4: Blacklisting removed drivers from leapp report..."
     if [[ -f /var/log/leapp/leapp-report.txt ]]; then
@@ -1590,6 +1600,11 @@ phase_preupgrade() {
     while [[ $attempt -lt $max_attempts ]]; do
         ((attempt++)) || true
         log_info "leapp preupgrade — attempt $attempt/$max_attempts..."
+
+        # Always re-run inhibitor fixes before each attempt.
+        # This ensures subscription-manager removal and answerfile are current.
+        state_set "PHASE_INHIBITORS" ""
+        phase_fix_inhibitors
 
         # Verify network is up before each attempt
         _restore_network
@@ -1830,6 +1845,55 @@ run_post_upgrade() {
 
 do_migrate() {
     log_section "MIGRATION WIZARD"
+
+    # ── Always run these checks regardless of saved state ───────────────────
+    # Subscription-manager removal and answerfile must be current on every run.
+    log_info "Pre-checks (always run)..."
+
+    # Remove subscription-manager unconditionally
+    if rpm -q subscription-manager &>/dev/null 2>&1; then
+        log_info "  Removing subscription-manager..."
+        yum remove -y subscription-manager \
+            --setopt=clean_requirements_on_remove=0 2>/dev/null | tail -3 || true
+        rpm -e --nodeps subscription-manager 2>/dev/null || true
+        log_ok "  subscription-manager removed."
+    fi
+    export LEAPP_NO_RHSM=1
+
+    # Write answerfile unconditionally (overwrite — always fresh)
+    mkdir -p /var/log/leapp 2>/dev/null || true
+    cat > /var/log/leapp/answerfile << 'ANSEOF'
+[remove_pam_pkcs11_module_check]
+confirm = True
+
+[authselect_check]
+confirm = True
+
+[remove_ifcfg_files_check]
+confirm = True
+
+[grub_enableos_prober_check]
+confirm = True
+
+[verify_check_results]
+confirm = True
+
+[modified_files_check]
+confirm = True
+
+[check_custom_actors]
+confirm = True
+ANSEOF
+    log_ok "  Answerfile written."
+
+    # Install nspawn wrapper unconditionally (idempotent)
+    _install_nspawn_wrapper
+    _prevent_nspawn_network_namespace
+
+    # Remove .orig backups unconditionally
+    find /usr/share/leapp-repository/ -name "*.el8migrate.orig" \
+        -delete 2>/dev/null || true
+    # ────────────────────────────────────────────────────────────────────────
 
     # Run preflight first — always
     log_info "Running preflight assessment..."
