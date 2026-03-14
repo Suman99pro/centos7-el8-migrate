@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.6.0"
+readonly SCRIPT_VERSION="3.8.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -875,6 +875,7 @@ phase_install_elevate() {
     # Must happen here — before ANY leapp command runs — so the actor
     # never executes without --network-none.
     log_info "Patching leapp actor (prevent NIC capture by nspawn)..."
+    _install_nspawn_wrapper
     _patch_leapp_actor
     _prevent_nspawn_network_namespace
 
@@ -980,210 +981,193 @@ PYEOF
 # This function is safe to call multiple times (idempotent).
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# _restore_network — bring host network back up if nspawn took it down
+# _find_primary_nic — find the real physical/virtual-machine NIC
+# Returns the interface name that should carry the default route.
+# Explicitly skips: lo, virbr*, veth*, docker*, br-*, bond (unless it has IP)
+# ---------------------------------------------------------------------------
+_find_primary_nic() {
+    # First: NIC that currently has the default route
+    local nic
+    nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+    [[ -n "$nic" ]] && { echo "$nic"; return; }
+
+    # Second: use the NIC saved at script start (most reliable)
+    [[ -n "${PRIMARY_NIC:-}" ]] && { echo "$PRIMARY_NIC"; return; }
+
+    # Third: find non-virtual NICs with a link (exclude virbr/veth/docker/br-)
+    while IFS= read -r iface; do
+        [[ "$iface" =~ ^(lo|virbr|veth|docker|br-|vnet|tun|tap) ]] && continue
+        ip link show "$iface" 2>/dev/null | grep -q "state UP\|state UNKNOWN" || continue
+        echo "$iface"; return
+    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//')
+
+    # Fourth: any non-virtual NIC even if DOWN
+    while IFS= read -r iface; do
+        [[ "$iface" =~ ^(lo|virbr|veth|docker|br-|vnet|tun|tap) ]] && continue
+        echo "$iface"; return
+    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//')
+}
+
+# ---------------------------------------------------------------------------
+# _restore_network — bring the primary NIC back up if nspawn took it down
+# Only touches the real NIC — never touches virbr0, veth, docker bridges
 # ---------------------------------------------------------------------------
 _restore_network() {
-    local nic gateway
-    # Find the primary NIC (first one with a default route)
-    nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-    gateway=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+    # If default route exists, network is fine
+    if ip route 2>/dev/null | grep -q "^default"; then
+        local nic gw
+        nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+        gw=$(ip route  2>/dev/null | awk '/^default/{print $3; exit}')
+        log_ok "  Network OK: $nic via $gw"
+        return 0
+    fi
 
+    log_warn "  No default route — network is down. Attempting recovery..."
+
+    local nic; nic=$(_find_primary_nic)
     if [[ -z "$nic" ]]; then
-        log_warn "  No default route — network is down. Attempting recovery..."
+        log_warn "  Cannot identify primary NIC — skipping recovery."
+        return 0
+    fi
 
-        # Try every non-loopback interface
-        while IFS= read -r iface; do
-            [[ "$iface" == "lo" ]] && continue
-            log_info "  Bringing up: $iface"
-            ip link set "$iface" up 2>/dev/null || true
-            # Re-request DHCP
-            if command -v dhclient &>/dev/null 2>&1; then
-                dhclient -r "$iface" 2>/dev/null || true
-                dhclient "$iface" 2>/dev/null &
-                sleep 4
-            elif command -v nmcli &>/dev/null 2>&1; then
-                nmcli device connect "$iface" 2>/dev/null || true
-                sleep 3
-            fi
-            # Check if we have a route now
-            ip route 2>/dev/null | grep -q "^default" && {
-                log_ok "  Network restored via $iface."
-                return 0
-            }
-        done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -v "^lo$")
+    log_info "  Primary NIC: $nic — bringing up..."
 
-        # Last resort: restart NetworkManager
-        log_warn "  Restarting NetworkManager..."
-        systemctl restart NetworkManager 2>/dev/null || true
-        sleep 5
-        ip route 2>/dev/null | grep -q "^default" && \
-            log_ok "  Network restored via NetworkManager restart." || \
-            log_warn "  Network could not be restored automatically."
+    # Bring link up
+    ip link set "$nic" up 2>/dev/null || true
+    sleep 2
+
+    # Try NetworkManager first (cleanest on CentOS 7)
+    if command -v nmcli &>/dev/null 2>&1; then
+        log_info "  Reconnecting via NetworkManager..."
+        nmcli device connect "$nic" 2>/dev/null || true
+        sleep 4
+        if ip route 2>/dev/null | grep -q "^default"; then
+            log_ok "  Network restored via NetworkManager ($nic)."
+            return 0
+        fi
+    fi
+
+    # Fallback: dhclient — kill any competing instance first
+    if command -v dhclient &>/dev/null 2>&1; then
+        log_info "  Trying dhclient on $nic..."
+        # Kill any existing dhclient for this NIC to avoid conflicts
+        pkill -f "dhclient.*$nic" 2>/dev/null || true
+        sleep 1
+        dhclient "$nic" 2>/dev/null
+        sleep 4
+        if ip route 2>/dev/null | grep -q "^default"; then
+            log_ok "  Network restored via dhclient ($nic)."
+            return 0
+        fi
+    fi
+
+    # Last resort: restart NetworkManager entirely
+    log_warn "  Restarting NetworkManager..."
+    systemctl restart NetworkManager 2>/dev/null || true
+    sleep 6
+    if ip route 2>/dev/null | grep -q "^default"; then
+        log_ok "  Network restored via NetworkManager restart."
     else
-        log_ok "  Network OK: $nic via $gateway"
+        log_warn "  Network could not be restored. Migration continues — check connectivity."
     fi
 }
 
 # ---------------------------------------------------------------------------
-# _patch_leapp_actor — inject --network-none into the nspawn call leapp makes
+# _install_nspawn_wrapper — THE definitive fix for enp0s3 disappearing
 #
-# leapp's dnfplugin actor builds the systemd-nspawn command in Python.
-# We find that file and patch it to add --network-none, which prevents nspawn
-# from creating a network namespace that steals the host NIC.
-# With --network-none, the container has no network — but that's fine because
-# we pre-populate the installroot from the host before leapp runs.
+# Every previous approach (regex patching Python files) failed because the
+# nspawn command is assembled dynamically across multiple files. The wrapper
+# approach is bulletproof: replace the nspawn binary itself with a shell
+# script that injects --network-none into every single call, no matter which
+# leapp actor triggers it or how arguments are built.
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# _patch_leapp_actor
-#
-# ROOT CAUSE (confirmed via systemd issue #4330 + leapp source):
-#   leapp's targetuserspacecreator actor runs:
-#     systemd-nspawn --register=no --quiet -D <overlay> dnf install ...
-#   On systemd v219 (CentOS 7), nspawn WITHOUT --network-none creates a
-#   MACVLAN or veth pair that moves enp0s3 into the container namespace.
-#   When the container exits, systemd v219 has a bug: it does NOT move
-#   the interface back to the host namespace. Result: enp0s3 disappears
-#   from the host, script loses SSH/network, exits mid-run.
-#
-# FIX: Surgically patch userspacegen.py to inject '--network-none' into
-#   the nspawn command list. With --network-none, nspawn never touches
-#   the host network stack. The host-side dnf bootstrap pre-populates
-#   the installroot so network inside the container is not needed.
-#
-# Targets (in priority order):
-#   1. /usr/share/leapp-repository/.../userspacegen.py  (ELevate install)
-#   2. /etc/leapp/repos.d/.../userspacegen.py           (alternative path)
-#   3. Any .py file containing the nspawn command       (fallback)
-# ---------------------------------------------------------------------------
-_patch_leapp_actor() {
-    log_info "  [A] Patching leapp actor to add --network-none to nspawn..."
+_install_nspawn_wrapper() {
+    log_info "  [A] Installing systemd-nspawn --network-none wrapper..."
 
-    local search_dirs=(
-        "/usr/share/leapp-repository"
-        "/etc/leapp/repos.d"
-        "/usr/lib/leapp"
-    )
+    local real_bin="/usr/bin/systemd-nspawn"
+    local real_backup="/usr/bin/systemd-nspawn.el8migrate.real"
+    local marker="EL8MIGRATE_WRAPPER"
 
-    local found_any=false
-
-    for search_dir in "${search_dirs[@]}"; do
-        [[ -d "$search_dir" ]] || continue
-
-        # Find Python files that contain the exact nspawn command leapp runs
-        while IFS= read -r pyfile; do
-            [[ -f "$pyfile" ]] || continue
-
-            # Skip if already patched
-            if grep -q "network-none\|PATCHED_EL8_MIGRATE" "$pyfile" 2>/dev/null; then
-                log_ok "  Already patched: $(basename "$pyfile")"
-                found_any=true
-                continue
-            fi
-
-            # Only patch files that actually contain the nspawn call
-            grep -q "systemd-nspawn" "$pyfile" 2>/dev/null || continue
-
-            log_info "  Found nspawn actor: $pyfile"
-            found_any=true
-
-            # Backup
-            [[ -f "${pyfile}.el8migrate.orig" ]] || \
-                cp -f "$pyfile" "${pyfile}.el8migrate.orig" 2>/dev/null || true
-
-            # Surgical patch using python2 (always available on CentOS 7)
-            python2 - "$pyfile" << 'PYEOF'
-import sys, re
-
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-
-original = content
-patched = False
-
-# ── Pattern 1 ─────────────────────────────────────────────────────────────
-# The nspawn cmd is built as a Python list then passed to run_cmd/check_call.
-# Example from userspacegen.py:
-#   cmd = ['systemd-nspawn', '--register=no', '--quiet', '-D', ...]
-#
-# Inject '--network-none' right after '--register=no'
-def inject_after_register(m):
-    global patched
-    s = m.group(0)
-    if '--network-none' not in s:
-        s = s.replace("'--register=no'", "'--register=no', '--network-none'", 1)
-        s = s.replace('"--register=no"', '"--register=no", "--network-none"', 1)
-        patched = True
-    return s
-
-# Match list literals containing systemd-nspawn (possibly multi-line)
-content = re.sub(
-    r"\[['\"]systemd-nspawn['\"].*?\]",
-    inject_after_register,
-    content,
-    flags=re.DOTALL
-)
-
-# ── Pattern 2 ─────────────────────────────────────────────────────────────
-# nspawn args built by appending to a list variable:
-#   nspawn_cmd = ['systemd-nspawn']
-#   nspawn_cmd += ['--register=no', '--quiet', ...]
-if not patched:
-    def inject_in_extend(m):
-        global patched
-        s = m.group(0)
-        if '--network-none' not in s and '--register=no' in s:
-            s = s.replace("'--register=no'", "'--register=no', '--network-none'", 1)
-            patched = True
-        return s
-    content = re.sub(r"\[.*?'--register=no'.*?\]", inject_in_extend, content)
-
-# ── Pattern 3 ─────────────────────────────────────────────────────────────
-# String-form nspawn (rare but possible in older leapp):
-#   'systemd-nspawn --register=no --quiet -D ...'
-if not patched:
-    new_content = re.sub(
-        r"(systemd-nspawn\s+--register=no)",
-        r"\1 --network-none",
-        content
-    )
-    if new_content != content:
-        content = new_content
-        patched = True
-
-if patched:
-    # Add marker so we don't double-patch
-    content += '\n# PATCHED_EL8_MIGRATE: --network-none injected to prevent NIC capture\n'
-    with open(path, 'w') as f:
-        f.write(content)
-    print("PATCHED: " + path)
-    sys.exit(0)
-else:
-    print("SKIP: no patchable nspawn pattern found in " + path)
-    sys.exit(1)
-PYEOF
-
-            local rc=$?
-            if [[ $rc -eq 0 ]]; then
-                log_ok "  Patched: $(basename "$pyfile")"
-                # Verify the patch is actually in the file
-                if grep -q "network-none" "$pyfile" 2>/dev/null; then
-                    log_ok "  Verified: --network-none present in $pyfile"
-                else
-                    log_warn "  Patch may not have taken — manual check needed"
-                fi
-            else
-                log_warn "  Could not auto-patch: $(basename "$pyfile")"
-                log_warn "  Relying on host-side bootstrap instead."
-            fi
-
-        done < <(find "$search_dir" -name "*.py" 2>/dev/null)
-    done
-
-    if [[ "$found_any" == false ]]; then
-        log_warn "  No leapp actor files found yet (leapp not installed)."
-        log_info "  Actor will be patched after ELevate install."
+    if grep -q "$marker" "$real_bin" 2>/dev/null; then
+        log_ok "  nspawn wrapper already in place."
+        return 0
     fi
+
+    if [[ ! -f "$real_bin" ]]; then
+        log_warn "  $real_bin not found — skipping wrapper."
+        return 0
+    fi
+
+    [[ -f "$real_backup" ]] || cp -f "$real_bin" "$real_backup" 2>/dev/null || {
+        log_warn "  Cannot back up $real_bin — skipping wrapper."
+        return 0
+    }
+
+    cat > "$real_bin" << 'WRAPPER'
+#!/usr/bin/env bash
+# EL8MIGRATE_WRAPPER — injects --network-none into every nspawn call.
+# Prevents systemd-nspawn v219 from moving enp0s3 into container namespace.
+REAL="/usr/bin/systemd-nspawn.el8migrate.real"
+ARGS=("$@")
+has_network_none=false; is_boot=false
+for a in "${ARGS[@]}"; do
+    [[ "$a" == "--network-none" ]] && has_network_none=true
+    [[ "$a" == "--boot" || "$a" == "-b" ]] && is_boot=true
+done
+if [[ "$has_network_none" == false && "$is_boot" == false ]]; then
+    exec "$REAL" --network-none "${ARGS[@]}"
+else
+    exec "$REAL" "${ARGS[@]}"
+fi
+WRAPPER
+
+    chmod +x "$real_bin" 2>/dev/null || true
+
+    if grep -q "$marker" "$real_bin" 2>/dev/null; then
+        log_ok "  nspawn wrapper installed — NIC capture prevented for all leapp actors."
+    else
+        cp -f "$real_backup" "$real_bin" 2>/dev/null || true
+        log_warn "  Wrapper write failed — restored original."
+    fi
+}
+
+_remove_nspawn_wrapper() {
+    local real_bin="/usr/bin/systemd-nspawn"
+    local real_backup="/usr/bin/systemd-nspawn.el8migrate.real"
+    if [[ -f "$real_backup" ]]; then
+        cp -f "$real_backup" "$real_bin" 2>/dev/null && \
+            rm -f "$real_backup" && \
+            log_ok "systemd-nspawn restored to original."
+    fi
+}
+
+# Keep Python actor patching as belt-and-suspenders
+_patch_leapp_actor() {
+    log_info "  [A2] Patching leapp Python actors (belt-and-suspenders)..."
+    local found=false
+    for d in /usr/share/leapp-repository /etc/leapp/repos.d /usr/lib/leapp; do
+        [[ -d "$d" ]] || continue
+        while IFS= read -r f; do
+            grep -q "systemd-nspawn" "$f" 2>/dev/null || continue
+            grep -q "PATCHED_EL8_MIGRATE" "$f" 2>/dev/null && { found=true; continue; }
+            [[ -f "${f}.el8migrate.orig" ]] || cp -f "$f" "${f}.el8migrate.orig" 2>/dev/null || true
+            python2 - "$f" << 'PYEOF' 2>/dev/null && { log_ok "  Patched: $(basename "$f")"; found=true; } || true
+import sys, re
+p = sys.argv[1]
+with open(p) as fh: c = fh.read()
+orig = c
+c = re.sub(r"'--register=no'(\s*,)", r"'--register=no', '--network-none'\1", c)
+c = re.sub(r'"--register=no"(\s*,)', r'"--register=no", "--network-none"\1', c)
+c = re.sub(r'(systemd-nspawn\s+--register=no(?!\s+--network-none))', r'\1 --network-none', c)
+if c != orig:
+    c += '\n# PATCHED_EL8_MIGRATE\n'
+    with open(p, 'w') as fh: fh.write(c)
+    sys.exit(0)
+sys.exit(1)
+PYEOF
+        done < <(find "$d" -name "*.py" 2>/dev/null)
+    done
+    [[ "$found" == true ]] || log_info "  No actor files found yet."
 }
 
 # ---------------------------------------------------------------------------
@@ -1340,6 +1324,7 @@ fix_nspawn_network() {
     log_info "Applying nspawn remediation (all layers)..."
 
     # Layers A+B run unconditionally — they prevent future network disruption
+    _install_nspawn_wrapper
     _patch_leapp_actor
     _prevent_nspawn_network_namespace
 
@@ -1557,35 +1542,44 @@ phase_preupgrade() {
     # These prevent nspawn from stealing the host NIC — must happen before
     # leapp ever spawns a container, not after the NIC is already gone.
     log_info "Pre-flight: patching nspawn to prevent host network disruption..."
+    _install_nspawn_wrapper
     _patch_leapp_actor
     _prevent_nspawn_network_namespace
 
-    # Start a background NIC watchdog.
-    # If nspawn takes enp0s3 down despite our patches, this brings it back
-    # within 3 seconds so the script can continue.
-    local primary_nic
-    primary_nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-    if [[ -n "$primary_nic" ]]; then
-        log_info "Starting NIC watchdog for $primary_nic (background)..."
+    # Record the primary NIC NOW before leapp runs — this is the authoritative
+    # source for _restore_network and the watchdog to use.
+    PRIMARY_NIC=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+    if [[ -z "$PRIMARY_NIC" ]]; then
+        PRIMARY_NIC=$(_find_primary_nic)
+    fi
+    export PRIMARY_NIC
+
+    # Start a background NIC watchdog ONLY if we know the real NIC.
+    # The watchdog uses NM (not dhclient) to avoid competing with existing DHCP.
+    # It only acts if the interface actually goes DOWN — not just missing route.
+    local WATCHDOG_PID=""
+    if [[ -n "$PRIMARY_NIC" ]]; then
+        log_info "Primary NIC: $PRIMARY_NIC — starting watchdog..."
         (
+            local nic="$PRIMARY_NIC"
             while true; do
-                sleep 3
-                if ! ip link show "$primary_nic" 2>/dev/null | grep -q "state UP"; then
-                    echo "[watchdog] $primary_nic is DOWN — restoring..." >> "$LOG_FILE" 2>/dev/null || true
-                    ip link set "$primary_nic" up 2>/dev/null || true
-                    sleep 1
-                    # Try DHCP if no IP after link up
-                    if ! ip addr show "$primary_nic" 2>/dev/null | grep -q "inet "; then
-                        dhclient -r "$primary_nic" 2>/dev/null || true
-                        dhclient "$primary_nic" 2>/dev/null || true
+                sleep 5
+                # Check if NIC went DOWN (link state, not just missing route)
+                if ip link show "$nic" 2>/dev/null | grep -q "state DOWN\|NO-CARRIER"; then
+                    echo "[watchdog $(date '+%H:%M:%S')] $nic is DOWN — restoring link..." \
+                        >> "${LOG_FILE:-/tmp/el8migrate.log}" 2>/dev/null || true
+                    ip link set "$nic" up 2>/dev/null || true
+                    sleep 2
+                    # Use NM if available — it manages DHCP cleanly
+                    if command -v nmcli &>/dev/null 2>&1; then
+                        nmcli device connect "$nic" 2>/dev/null || true
                     fi
                 fi
             done
         ) &
-        local WATCHDOG_PID=$!
-        log_info "NIC watchdog running (PID $WATCHDOG_PID)."
+        WATCHDOG_PID=$!
+        log_info "NIC watchdog PID $WATCHDOG_PID (monitors $PRIMARY_NIC)."
     else
-        local WATCHDOG_PID=""
         log_warn "Could not determine primary NIC — watchdog not started."
     fi
 
@@ -1715,7 +1709,8 @@ phase_upgrade() {
 run_post_upgrade() {
     log_section "POST-UPGRADE VALIDATION"
 
-    echo "--- OS Release ---"
+    # Restore original systemd-nspawn (remove our wrapper — no longer needed)
+    _remove_nspawn_wrapper
     cat /etc/os-release 2>/dev/null || echo "(not found)"
     echo
 
