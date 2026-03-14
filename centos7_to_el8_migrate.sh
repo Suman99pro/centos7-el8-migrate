@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.9.0"
+readonly SCRIPT_VERSION="3.10.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -1115,7 +1115,7 @@ for a in "${ARGS[@]}"; do
     [[ "$a" == "--boot" || "$a" == "-b" ]] && is_boot=true
 done
 if [[ "$has_network_none" == false && "$is_boot" == false ]]; then
-    exec "$REAL" --network-none "${ARGS[@]}"
+    exec "$REAL" --network-none --setenv=LEAPP_NO_RHSM=1 "${ARGS[@]}"
 else
     exec "$REAL" "${ARGS[@]}"
 fi
@@ -1379,21 +1379,47 @@ phase_fix_inhibitors() {
     # Steps 1-3 run unconditionally on EVERY call (idempotent, cheap).
     # Critical: these must run even when resuming from a saved state.
 
-    # Step 1: Remove subscription-manager — causes hard blocker on non-RHEL.
-    log_info "Step 1: Removing subscription-manager..."
-    if rpm -q subscription-manager &>/dev/null 2>&1; then
-        yum remove -y subscription-manager \
-            --setopt=clean_requirements_on_remove=0 2>/dev/null | tail -3 || true
-        # Force remove if yum failed
-        rpm -q subscription-manager &>/dev/null 2>&1 && \
-            rpm -e --nodeps subscription-manager 2>/dev/null || true
-        rpm -q subscription-manager &>/dev/null 2>&1 && \
-            log_warn "  Could not remove subscription-manager!" || \
-            log_ok "  subscription-manager removed."
-    else
-        log_ok "  subscription-manager not installed."
-    fi
+    # Step 1: Neutralize subscription-manager completely.
+    # leapp's target_userspace_creator actor tries to call subscription-manager
+    # inside the nspawn container. We use 3 layers:
+    #   a) Remove all sub-mgr packages
+    #   b) Stub the binary to return 0 silently if removal fails
+    #   c) LEAPP_NO_RHSM=1 env var on all leapp commands
+    log_info "Step 1: Neutralizing subscription-manager..."
     export LEAPP_NO_RHSM=1
+
+    # Layer a: Remove sub-mgr and related packages
+    local _smpkgs
+    _smpkgs=$(rpm -qa 2>/dev/null | grep -E \
+        "^(subscription-manager|python-syspurpose|python3-syspurpose)" || true)
+    if [[ -n "$_smpkgs" ]]; then
+        log_info "  Removing packages: $(echo "$_smpkgs" | tr '\n' ' ')"
+        # shellcheck disable=SC2086
+        yum remove -y --setopt=clean_requirements_on_remove=0 \
+            $( echo "$_smpkgs" | tr '\n' ' ' ) 2>/dev/null | tail -3 || true
+        # rpm force if yum couldn't do it
+        while IFS= read -r _pkg; do
+            [[ -z "$_pkg" ]] && continue
+            rpm -q "$_pkg" &>/dev/null 2>&1 && \
+                rpm -e --nodeps "$_pkg" 2>/dev/null || true
+        done <<< "$_smpkgs"
+    fi
+
+    # Layer b: Stub binary if still present
+    local _smbin
+    _smbin=$(command -v subscription-manager 2>/dev/null || echo "")
+    if [[ -n "$_smbin" ]] && [[ -f "$_smbin" ]]; then
+        if ! grep -q "EL8MIGRATE" "$_smbin" 2>/dev/null; then
+            cp -f "$_smbin" "${_smbin}.el8migrate.real" 2>/dev/null || true
+            printf "#!/bin/sh\n# EL8MIGRATE\nexit 0\n" > "$_smbin" 2>/dev/null || true
+            chmod +x "$_smbin" 2>/dev/null || true
+            log_ok "  subscription-manager stubbed (returns 0)."
+        else
+            log_ok "  subscription-manager already stubbed."
+        fi
+    else
+        log_ok "  subscription-manager not present."
+    fi
 
     # Step 2: Write leapp answerfile (overwrite — no duplicates).
     log_info "Step 2: Writing leapp answerfile..."
@@ -1435,7 +1461,7 @@ ANSEOF
 
     # Step 3: Remove .orig backup files (leapp flags as custom actors)
     log_info "Step 3: Removing .orig backup files..."
-    find /usr/share/leapp-repository/ -name "*.el8migrate.orig" \
+    find /usr/share/leapp-repository/ \( -name "*.el8migrate.orig" -o -name "*.orig" \) \
         -delete 2>/dev/null || true
     log_ok "  .orig backups removed."
 
@@ -1850,15 +1876,27 @@ do_migrate() {
     # Subscription-manager removal and answerfile must be current on every run.
     log_info "Pre-checks (always run)..."
 
-    # Remove subscription-manager unconditionally
-    if rpm -q subscription-manager &>/dev/null 2>&1; then
-        log_info "  Removing subscription-manager..."
-        yum remove -y subscription-manager \
-            --setopt=clean_requirements_on_remove=0 2>/dev/null | tail -3 || true
-        rpm -e --nodeps subscription-manager 2>/dev/null || true
-        log_ok "  subscription-manager removed."
-    fi
+    # Remove + stub subscription-manager unconditionally
     export LEAPP_NO_RHSM=1
+    local _pre_smpkgs
+    _pre_smpkgs=$(rpm -qa 2>/dev/null | grep -E \
+        "^(subscription-manager|python-syspurpose|python3-syspurpose)" || true)
+    if [[ -n "$_pre_smpkgs" ]]; then
+        log_info "  Removing: $(echo "$_pre_smpkgs" | tr '\n' ' ')"
+        yum remove -y --setopt=clean_requirements_on_remove=0 \
+            $(echo "$_pre_smpkgs" | tr '\n' ' ') 2>/dev/null | tail -3 || true
+        while IFS= read -r _p; do
+            [[ -z "$_p" ]] && continue
+            rpm -q "$_p" &>/dev/null 2>&1 && rpm -e --nodeps "$_p" 2>/dev/null || true
+        done <<< "$_pre_smpkgs"
+    fi
+    # Stub if still present
+    local _smb; _smb=$(command -v subscription-manager 2>/dev/null || echo "")
+    if [[ -n "$_smb" ]] && [[ -f "$_smb" ]] && ! grep -q "EL8MIGRATE" "$_smb" 2>/dev/null; then
+        cp -f "$_smb" "${_smb}.el8migrate.real" 2>/dev/null || true
+        printf "#!/bin/sh\n# EL8MIGRATE\nexit 0\n" > "$_smb" && chmod +x "$_smb" || true
+        log_ok "  subscription-manager stubbed."
+    fi
 
     # Write answerfile unconditionally (overwrite — always fresh)
     mkdir -p /var/log/leapp 2>/dev/null || true
