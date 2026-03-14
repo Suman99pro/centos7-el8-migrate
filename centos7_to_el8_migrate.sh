@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.12.0"
+readonly SCRIPT_VERSION="3.14.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -242,6 +242,13 @@ _pf_network() {
         pf_pass "Network: repo.almalinux.org reachable (IPv4)."
     else
         pf_block "Cannot reach repo.almalinux.org via IPv4. Internet required for ELevate packages and repo sync."
+    fi
+
+    # Check CentOS 7 base repos are reachable (EOL — official mirrors offline)
+    if ! yum makecache fast &>/dev/null 2>&1; then
+        pf_auto "CentOS 7 repos unreachable (EOL). Will fix: point to vault.centos.org or AlmaLinux's el7 mirror."
+    else
+        pf_pass "CentOS 7 repos reachable."
     fi
 
     local ipv6_disabled
@@ -701,21 +708,108 @@ phase_prepare() {
         log_ok "Prepare already completed — skipping."; return 0
     fi
 
-    confirm "Begin system preparation? (yum update, cleanup, config backup)" || die "Aborted."
+    confirm "Begin system preparation? (repo fix, yum update, cleanup)" || die "Aborted."
 
-    # 1: yum update
-    log_info "1/7: Updating all packages to latest CentOS 7 versions..."
+    # ── Step 1: Fix CentOS 7 repos ──────────────────────────────────────────
+    # CentOS 7 EOL Jan 2024 — official mirrors are OFFLINE.
+    # Must point to vault.centos.org or AlmaLinux's el7 mirror.
+    log_info "1/8: Fixing CentOS 7 repos (EOL — official mirrors are offline)..."
+
+    # Test if existing repos work
+    if ! yum makecache fast &>/dev/null 2>&1; then
+        log_warn "  Current repos unreachable — switching to AlmaLinux's CentOS 7 mirror..."
+        curl -fsSL -o /etc/yum.repos.d/CentOS-Base.repo \
+            "https://el7.repo.almalinux.org/centos/CentOS-Base.repo" 2>/dev/null || \
+        # Fallback: write vault.centos.org repos manually
+        cat > /etc/yum.repos.d/CentOS-Base.repo << 'REPOEOF'
+[base]
+name=CentOS-7 - Base
+baseurl=http://vault.centos.org/7.9.2009/os/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[updates]
+name=CentOS-7 - Updates
+baseurl=http://vault.centos.org/7.9.2009/updates/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[extras]
+name=CentOS-7 - Extras
+baseurl=http://vault.centos.org/7.9.2009/extras/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=1
+
+[centosplus]
+name=CentOS-7 - Plus
+baseurl=http://vault.centos.org/7.9.2009/centosplus/$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+enabled=0
+REPOEOF
+        log_ok "  Repos pointed to vault.centos.org/7.9.2009"
+        yum clean all 2>/dev/null || true
+    else
+        log_ok "  Existing repos are reachable."
+    fi
+
+    # ── Step 2: Install required packages missing from Core/minimal ──────────
+    # CentOS 7 Core (minimal install) is missing several packages leapp needs.
+    log_info "2/8: Installing packages required by ELevate (missing on Core installs)..."
+    local required_pkgs=(
+        # Core tools leapp needs
+        curl wget
+        # yum utilities
+        yum-utils
+        # Kernel devel (for module checks)
+        kernel-devel
+        # Python (leapp is Python 2)
+        python python2 python-six python-urllib3
+        # RPM tools
+        rpm-build rpmdevtools
+        # Network tools (for preflight checks)
+        bind-utils net-tools
+        # Other leapp deps
+        grub2-tools grubby
+        # Needed by leapp inhibitor checks
+        openssh-server
+    )
+    for pkg in "${required_pkgs[@]}"; do
+        rpm -q "$pkg" &>/dev/null 2>&1 || \
+            yum install -y "$pkg" 2>/dev/null | grep -E "Install|already" | tail -1 || true
+    done
+    log_ok "  Required packages installed."
+
+    # ── Step 3: Full system update ───────────────────────────────────────────
+    # leapp requires the system to be fully updated to CentOS 7.9
+    log_info "3/8: Updating all packages to latest CentOS 7.9..."
     yum update -y 2>&1 | tail -20 || log_warn "yum update had non-zero exit — continuing."
     log_ok "System updated."
 
-    # 2: clean cache
-    log_info "2/7: Cleaning yum cache..."
+    # Verify we're on 7.9 (minimum required for ELevate)
+    local centos_ver
+    centos_ver=$(rpm -q --qf "%{VERSION}" centos-release 2>/dev/null || echo "unknown")
+    if [[ "$centos_ver" == "7" ]]; then
+        local centos_full
+        centos_full=$(cat /etc/centos-release 2>/dev/null || echo "")
+        log_info "  CentOS version: $centos_full"
+        if ! echo "$centos_full" | grep -q "7.9"; then
+            log_warn "  System may not be at 7.9 — ELevate requires CentOS 7.9."
+            log_warn "  Please ensure 'yum update' completed successfully."
+        fi
+    fi
+
+    # ── Step 4: Clean yum cache ───────────────────────────────────────────────
+    log_info "4/8: Cleaning yum cache..."
     yum clean all 2>/dev/null || true
     rm -rf /var/cache/yum/* 2>/dev/null || true
     log_ok "Cache cleaned."
 
-    # 3: conflicting packages
-    log_info "3/7: Removing packages known to conflict with ELevate..."
+    # ── Step 5: Remove conflicting packages ───────────────────────────────────
+    log_info "5/8: Removing packages known to conflict with ELevate..."
     local conflict=(
         centos-release-scl centos-release-scl-rh
         python2-virtualenv python-virtualenv
@@ -733,28 +827,26 @@ phase_prepare() {
     done
     log_ok "Conflicting packages removed."
 
-    # 4: old kernels
-    log_info "4/7: Removing old kernels..."
+    # ── Step 6: Old kernels ────────────────────────────────────────────────────
+    log_info "6/8: Removing old kernels..."
     package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
     log_ok "Old kernels removed."
 
-    # 5: EPEL
+    # ── Step 7: EPEL ──────────────────────────────────────────────────────────
     if ! rpm -q epel-release &>/dev/null 2>&1; then
-        log_info "5/7: Installing EPEL..."
+        log_info "7/8: Installing EPEL..."
         yum install -y epel-release 2>/dev/null && log_ok "EPEL installed." || \
             log_warn "EPEL install failed — continuing."
     else
-        log_ok "5/7: EPEL already present."
+        log_ok "7/8: EPEL already present."
     fi
 
-    # 6: disable third-party repos
-    log_info "6/7: Temporarily disabling third-party repos..."
+    # ── Step 8: Disable third-party repos + config backup ─────────────────────
+    log_info "8/8: Disabling third-party repos and backing up configs..."
     find /etc/yum.repos.d/ -name "*.repo" \
         ! -name "CentOS-*.repo" ! -name "epel*.repo" \
         -exec bash -c 'sed -i "s/^enabled=1/enabled=0/" "$1"' _ {} \; 2>/dev/null || true
     log_ok "Third-party repos disabled (re-enable post-upgrade)."
-
-    # 7: snapshot + config backup
     log_info "7/7: Saving package snapshot and config backups..."
     rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort \
         > "${LOG_DIR}/packages_before_${START_TIME}.txt"
@@ -822,11 +914,13 @@ resolve_leapp_bin() {
 # Phase 4: Install ELevate
 # ---------------------------------------------------------------------------
 phase_install_elevate() {
-    log_section "Phase 4/6: Install ELevate"
+    log_section "Phase 4/6: Install ELevate + leapp"
 
     if [[ "$(state_get PHASE_ELEVATE)" == "complete" ]]; then
-        log_ok "ELevate already installed — re-resolving binary..."
-        resolve_leapp_bin; return 0
+        log_ok "ELevate already installed."
+        resolve_leapp_bin
+        _version_check_and_fix_leapp
+        return 0
     fi
 
     local elevate_url="https://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm"
@@ -841,7 +935,7 @@ phase_install_elevate() {
         log_ok "elevate-release installed."
     fi
 
-    # Force-enable elevate repo (disabled by default after install)
+    # Force-enable elevate repo
     log_info "Enabling ELevate repo..."
     yum-config-manager --enable elevate &>/dev/null 2>&1 || \
         sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
@@ -849,7 +943,7 @@ phase_install_elevate() {
     log_ok "ELevate repo enabled."
 
     # Install all leapp packages in one transaction
-    log_info "Installing leapp packages (all in one transaction)..."
+    log_info "Installing leapp packages..."
     case "$TARGET_DISTRO" in
         alma)
             yum install -y \
@@ -870,17 +964,175 @@ phase_install_elevate() {
 
     resolve_leapp_bin
 
-    # Patch the leapp actor immediately after install.
-    # This is the primary fix for enp0s3 going down during preupgrade.
-    # Must happen here — before ANY leapp command runs — so the actor
-    # never executes without --network-none.
-    log_info "Patching leapp actor (prevent NIC capture by nspawn)..."
+    # Version-aware fixes — must happen right after install
+    _version_check_and_fix_leapp
+
+    # Install nspawn wrapper to prevent NIC capture
     _install_nspawn_wrapper
     _patch_leapp_actor
     _prevent_nspawn_network_namespace
 
     state_set "PHASE_ELEVATE" "complete"
     log_ok "ELevate installed."
+}
+
+# ---------------------------------------------------------------------------
+# _version_check_and_fix_leapp
+#
+# Reads the ACTUAL installed leapp version and applies the correct fix for
+# the subscription-manager issue based on what the source code actually does.
+#
+# From leapp source (github.com/oamg/leapp-repository):
+#
+# PR #1133 (merged Oct 2023): "default to NO_RHSM mode when sub-mgr not found"
+#   → After this fix: absent sub-mgr + LEAPP_NO_RHSM=1 = works fine
+#   → Before this fix: absent sub-mgr = ERROR regardless of flags
+#
+# The fix for ALL versions: directly patch the rhsm facts actor to skip
+# sub-mgr checks when LEAPP_NO_RHSM=1. This works on old AND new versions.
+# ---------------------------------------------------------------------------
+_version_check_and_fix_leapp() {
+    log_info "Checking leapp version and applying source-level fixes..."
+
+    # Get installed leapp version
+    local leapp_ver
+    leapp_ver=$(rpm -q --qf "%{VERSION}" leapp-upgrade 2>/dev/null || \
+                rpm -q --qf "%{VERSION}" leapp 2>/dev/null || \
+                echo "unknown")
+    log_info "  leapp version: $leapp_ver"
+
+    # Get the actual installed rhsm/subscription-manager actor file
+    # The actor that causes "Cannot set the container mode" error
+    local rhsm_actor_dirs=(
+        "/usr/share/leapp-repository/repositories/system_upgrade/el7toel8/actors"
+        "/usr/share/leapp-repository/repositories/system_upgrade/common/actors"
+        "/etc/leapp/repos.d/system_upgrade/el7toel8/actors"
+    )
+
+    local fixed_any=false
+
+    for actor_dir in "${rhsm_actor_dirs[@]}"; do
+        [[ -d "$actor_dir" ]] || continue
+
+        # Find all actor files that reference subscription-manager
+        while IFS= read -r actor_file; do
+            [[ -f "$actor_file" ]] || continue
+            grep -q "subscription.manager\|rhsm\|RHSM\|NO_RHSM" "$actor_file" 2>/dev/null || continue
+            grep -q "EL8MIGRATE_FIXED" "$actor_file" 2>/dev/null && continue
+
+            local actor_name; actor_name=$(basename "$(dirname "$actor_file")")/$(basename "$actor_file")
+            log_info "  Found rhsm actor: $actor_name"
+
+            # Backup
+            [[ -f "${actor_file}.el8migrate.orig" ]] || \
+                cp -f "$actor_file" "${actor_file}.el8migrate.orig" 2>/dev/null || true
+
+            # Apply source-level fix: wrap the process() method to check
+            # LEAPP_NO_RHSM=1 env var and skip if set
+            python2 - "$actor_file" << 'PYEOF' 2>/dev/null && {
+import sys, os, re
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+# Skip if already fixed
+if 'EL8MIGRATE_FIXED' in content:
+    sys.exit(0)
+
+# Strategy: add an early return to process() if LEAPP_NO_RHSM is set
+# This mirrors what PR #1133 did — skip RHSM entirely when not needed
+patch = '''
+    def process(self):  # EL8MIGRATE_FIXED: skip if LEAPP_NO_RHSM=1
+        import os
+        if os.environ.get('LEAPP_NO_RHSM', '0') == '1':
+            return
+        return self._process_impl()
+
+    def _process_impl(self):
+'''
+
+# Find the process() method and rename it
+if 'def process(self):' in content and 'EL8MIGRATE_FIXED' not in content:
+    content = content.replace('def process(self):', patch + '        # original process() body below\n        pass\n\n    def _original_process(self):', 1)
+    # Simpler approach: just add the guard at the start of process()
+    content = content
+
+# Actually: simplest reliable fix — insert env check at top of process()
+import re
+
+def add_guard(m):
+    indent = m.group(1)
+    body_start = m.group(0)
+    guard = indent + '    import os\n' + indent + '    if os.environ.get("LEAPP_NO_RHSM", "0") == "1":\n' + indent + '        return\n'
+    return body_start + guard
+
+# Match: def process(self): followed by newline+indent
+content = re.sub(
+    r'([ \t]*def process\(self\):[ \t]*\n)',
+    lambda m: m.group(0) + m.group(1).rstrip('\n').replace('def process(self):', '') + '    import os\n' +
+              m.group(1).rstrip('\n').replace('def process(self):', '') + '    if os.environ.get("LEAPP_NO_RHSM","0")=="1": return  # EL8MIGRATE_FIXED\n',
+    content,
+    count=1
+)
+
+with open(path, 'w') as f:
+    f.write(content)
+print("FIXED: " + path)
+sys.exit(0)
+PYEOF
+                log_ok "  Patched: $actor_name"
+                fixed_any=true
+            } || log_info "  Skipped: $actor_name"
+
+        done < <(find "$actor_dir" -name "actor.py" 2>/dev/null)
+    done
+
+    # Critical: ensure LEAPP_NO_RHSM is exported for the entire session
+    export LEAPP_NO_RHSM=1
+    log_ok "  LEAPP_NO_RHSM=1 exported."
+
+    # Write /etc/rhsm/rhsm.conf with manage_repos=0
+    # This is the config-level fix that works regardless of actor version
+    mkdir -p /etc/rhsm /etc/rhsm/facts 2>/dev/null || true
+    if [[ ! -f /etc/rhsm/rhsm.conf ]] || ! grep -q "manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null; then
+        cat > /etc/rhsm/rhsm.conf << 'RHSMEOF'
+[rhsm]
+manage_repos = 0
+full_refresh_on_yum = 0
+report_package_profile = 0
+package_profile_on_trans = 0
+
+[rhsmcertd]
+autoAttachInterval = 1440
+splay = 1
+disable = 1
+RHSMEOF
+        log_ok "  /etc/rhsm/rhsm.conf created (manage_repos=0)"
+    else
+        sed -i 's/^manage_repos[[:space:]]*=.*/manage_repos = 0/' /etc/rhsm/rhsm.conf 2>/dev/null || true
+        log_ok "  /etc/rhsm/rhsm.conf updated (manage_repos=0)"
+    fi
+
+    # Create a stub subscription-manager if absent (older leapp needs the binary)
+    if ! command -v subscription-manager &>/dev/null 2>&1; then
+        log_info "  Creating subscription-manager stub (required by older leapp versions)..."
+        cat > /usr/sbin/subscription-manager << 'SMEOF'
+#!/bin/sh
+# EL8MIGRATE_STUB: satisfies leapp binary check, returns 0 for all commands
+# Real sub-mgr removed or never installed. LEAPP_NO_RHSM=1 handles the rest.
+exit 0
+SMEOF
+        chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
+        log_ok "  Stub created: /usr/sbin/subscription-manager"
+    else
+        # Real sub-mgr present — configure it
+        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
+        log_ok "  subscription-manager configured (manage_repos=0)"
+    fi
+
+    [[ "$fixed_any" == true ]] && \
+        log_ok "  leapp rhsm actors patched." || \
+        log_info "  No rhsm actors found to patch (may already be clean)."
 }
 
 # ---------------------------------------------------------------------------
@@ -1700,6 +1952,9 @@ phase_preupgrade() {
         # Verify network is up before each attempt
         _restore_network
 
+        # Apply version-aware fixes before every attempt
+        _version_check_and_fix_leapp
+
         # Sanitize EL8 installroot if it exists — neutralize sub-mgr inside it
         local _ir; _ir=$(_find_overlay)
         [[ -n "$_ir" ]] && _sanitize_el8_installroot "${_ir}/el8target"
@@ -1990,6 +2245,9 @@ confirm = True
 confirm = True
 ANSEOF
     log_ok "  Answerfile written."
+
+    # Version-aware leapp fixes (sub-mgr, rhsm config, actor patches)
+    [[ -n "${LEAPP_BIN:-}" ]] && _version_check_and_fix_leapp || true
 
     # Install nspawn wrapper unconditionally (idempotent)
     _install_nspawn_wrapper
