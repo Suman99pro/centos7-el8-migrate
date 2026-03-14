@@ -29,7 +29,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # VERSION & CONSTANTS
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.3.0"
+readonly SCRIPT_VERSION="3.4.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
 
@@ -970,6 +970,180 @@ PYEOF
 #
 # This function is safe to call multiple times (idempotent).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _restore_network — bring host network back up if nspawn took it down
+# ---------------------------------------------------------------------------
+_restore_network() {
+    local nic gateway
+    # Find the primary NIC (first one with a default route)
+    nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+    gateway=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+
+    if [[ -z "$nic" ]]; then
+        log_warn "  No default route — network is down. Attempting recovery..."
+
+        # Try every non-loopback interface
+        while IFS= read -r iface; do
+            [[ "$iface" == "lo" ]] && continue
+            log_info "  Bringing up: $iface"
+            ip link set "$iface" up 2>/dev/null || true
+            # Re-request DHCP
+            if command -v dhclient &>/dev/null 2>&1; then
+                dhclient -r "$iface" 2>/dev/null || true
+                dhclient "$iface" 2>/dev/null &
+                sleep 4
+            elif command -v nmcli &>/dev/null 2>&1; then
+                nmcli device connect "$iface" 2>/dev/null || true
+                sleep 3
+            fi
+            # Check if we have a route now
+            ip route 2>/dev/null | grep -q "^default" && {
+                log_ok "  Network restored via $iface."
+                return 0
+            }
+        done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -v "^lo$")
+
+        # Last resort: restart NetworkManager
+        log_warn "  Restarting NetworkManager..."
+        systemctl restart NetworkManager 2>/dev/null || true
+        sleep 5
+        ip route 2>/dev/null | grep -q "^default" && \
+            log_ok "  Network restored via NetworkManager restart." || \
+            log_warn "  Network could not be restored automatically."
+    else
+        log_ok "  Network OK: $nic via $gateway"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# _patch_leapp_actor — inject --network-none into the nspawn call leapp makes
+#
+# leapp's dnfplugin actor builds the systemd-nspawn command in Python.
+# We find that file and patch it to add --network-none, which prevents nspawn
+# from creating a network namespace that steals the host NIC.
+# With --network-none, the container has no network — but that's fine because
+# we pre-populate the installroot from the host before leapp runs.
+# ---------------------------------------------------------------------------
+_patch_leapp_actor() {
+    log_info "  [A] Patching leapp nspawn actor to prevent host network disruption..."
+
+    # Find the actor file — it calls systemd-nspawn with the repo install
+    local actor_files=()
+    while IFS= read -r f; do
+        actor_files+=("$f")
+    done < <(find /usr/share/leapp-repository/ -name "*.py" 2>/dev/null | \
+             xargs grep -l "systemd-nspawn" 2>/dev/null || true)
+
+    if [[ ${#actor_files[@]} -eq 0 ]]; then
+        log_warn "  No leapp actor files found with systemd-nspawn reference."
+        return 0
+    fi
+
+    for actor in "${actor_files[@]+"${actor_files[@]}"}"; do
+        log_info "  Checking: $actor"
+
+        # Skip if already patched
+        if grep -q "network-none\|network_none\|ALREADY_PATCHED_BY_MIGRATION" \
+            "$actor" 2>/dev/null; then
+            log_ok "  Already patched: $actor"
+            continue
+        fi
+
+        # Backup original
+        [[ -f "${actor}.orig" ]] || cp -f "$actor" "${actor}.orig" 2>/dev/null || true
+
+        # Patch: add --network-none to the nspawn command list
+        python2 - "$actor" << 'PYEOF' 2>/dev/null && \
+            log_ok "  Patched: $actor" || \
+            log_warn "  Could not patch: $actor (will rely on pre-bootstrap instead)"
+import sys, re
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+# Strategy 1: Find the list that builds nspawn args and inject --network-none
+# Common patterns in leapp actors:
+#   cmd = ['systemd-nspawn', ...]
+#   nspawn_cmd = ['systemd-nspawn', ...]
+patched = False
+
+# Pattern: nspawn command built as a list literal
+def add_network_none(m):
+    global patched
+    patched = True
+    s = m.group(0)
+    if '--network-none' not in s and 'network-none' not in s:
+        # Insert --network-none after --register=no or after -D flag
+        s = re.sub(
+            r"('--register=no'|'--quiet')",
+            r"\1, '--network-none'",
+            s, count=1
+        )
+    return s
+
+content = re.sub(
+    r"\[['\"]\s*systemd-nspawn['\"].*?\]",
+    add_network_none,
+    content,
+    flags=re.DOTALL
+)
+
+# Strategy 2: Find string-based nspawn calls
+if not patched:
+    content = re.sub(
+        r"(systemd-nspawn\s+--register=no)",
+        r"\1 --network-none",
+        content
+    )
+    patched = True
+
+# Mark as patched
+content = content + '\n# ALREADY_PATCHED_BY_MIGRATION\n'
+
+with open(path, 'w') as f:
+    f.write(content)
+
+sys.exit(0)
+PYEOF
+    done
+}
+
+# ---------------------------------------------------------------------------
+# _prevent_nspawn_network_namespace
+#
+# systemd-nspawn v219 (CentOS 7) can create a private network namespace that
+# captures the host NIC. Prevent this by:
+#   1. systemd drop-in that disables PrivateNetwork for all nspawn units
+#   2. /etc/systemd/nspawn/ config for leapp's container
+# ---------------------------------------------------------------------------
+_prevent_nspawn_network_namespace() {
+    log_info "  [B] Preventing nspawn from creating isolated network namespace..."
+
+    # Drop-in for systemd-nspawn@.service
+    local dropin_dir="/etc/systemd/system/systemd-nspawn@.service.d"
+    mkdir -p "$dropin_dir" 2>/dev/null || true
+    cat > "${dropin_dir}/network.conf" << 'EOF'
+[Service]
+PrivateNetwork=no
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    log_ok "  systemd-nspawn PrivateNetwork=no drop-in applied."
+
+    # nspawn container config — tell nspawn to use host network
+    local nspawn_conf_dir="/etc/systemd/nspawn"
+    mkdir -p "$nspawn_conf_dir" 2>/dev/null || true
+    # leapp uses a container name based on the scratch dir — cover common names
+    for name in leapp root_ system_overlay; do
+        cat > "${nspawn_conf_dir}/${name}.nspawn" << 'EOF'
+[Network]
+Private=no
+VirtualEthernet=no
+EOF
+    done
+    log_ok "  nspawn container network config applied."
+}
+
 _host_dnf_bootstrap() {
     local overlay="$1"
     local leapp_repo; leapp_repo=$(_leapp_repo_file)
@@ -1073,72 +1247,65 @@ CONF
 # Applies ALL known fixes in order of least to most invasive.
 # Safe to call multiple times.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# fix_nspawn_network — all-layer nspawn fix
+# Layer A: patch leapp actor to add --network-none
+# Layer B: prevent systemd from creating isolated network namespace
+# Layer C: patch leapp repo files (sslverify=0, gpgcheck=0)
+# Layer D: fix machine-id collision
+# Layer E: inject host network config into overlay
+# Layer F: host-side dnf bootstrap (pre-populate installroot, no network needed)
+# ---------------------------------------------------------------------------
 fix_nspawn_network() {
-    log_info "Applying nspawn remediation (all strategies)..."
+    log_info "Applying nspawn remediation (all layers)..."
 
+    # Layers A+B run unconditionally — they prevent future network disruption
+    _patch_leapp_actor
+    _prevent_nspawn_network_namespace
+
+    # Layers C-F need the overlay to exist
     local overlay; overlay=$(_find_overlay)
-
     if [[ -z "$overlay" ]]; then
-        log_info "  Overlay not yet created — will run after first preupgrade attempt."
+        log_info "  Overlay not yet created — layers C-F will run after first preupgrade."
         return 0
     fi
     log_info "  Overlay: $overlay"
 
-    # ── 1. Patch leapp repo files (sslverify=0, gpgcheck=0) ─────────────────
-    log_info "  [1/5] Patching leapp EL8 repo files..."
+    # Layer C: patch leapp repo files
+    log_info "  [C] Patching leapp EL8 repo files (sslverify=0, gpgcheck=0)..."
     _patch_leapp_repos
 
-    # ── 2. machine-id collision ──────────────────────────────────────────────
-    log_info "  [2/5] Checking machine-id collision..."
+    # Layer D: machine-id collision
+    log_info "  [D] Checking machine-id collision..."
     local host_mid; host_mid=$(cat /etc/machine-id 2>/dev/null || echo "x")
     local ov_mid;   ov_mid=$(cat "${overlay}/etc/machine-id" 2>/dev/null || echo "")
     if [[ "$host_mid" == "$ov_mid" ]] && [[ -n "$ov_mid" ]]; then
         local new_id
-        new_id=$(od -An -tx1 /dev/urandom 2>/dev/null | head -1 | tr -d ' \n' | cut -c1-32 || \
-                 cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')
+        new_id=$(od -An -tx1 /dev/urandom 2>/dev/null | head -1 | \
+                 tr -d ' \n' | cut -c1-32)
         echo "$new_id" > "${overlay}/etc/machine-id" 2>/dev/null || true
         log_ok "  machine-id collision fixed."
     else
         log_ok "  machine-id OK."
     fi
 
-    # ── 3. Network files: resolv.conf + hosts + CA bundle ───────────────────
-    log_info "  [3/5] Injecting host network config into overlay..."
+    # Layer E: inject host network config
+    log_info "  [E] Injecting host network config into overlay..."
     mkdir -p "${overlay}/etc/pki/tls/certs" "${overlay}/etc/pki/ca-trust" 2>/dev/null || true
-    cp -f /etc/resolv.conf   "${overlay}/etc/resolv.conf"                   2>/dev/null || true
-    cp -f /etc/hosts         "${overlay}/etc/hosts"                          2>/dev/null || true
+    cp -f /etc/resolv.conf "${overlay}/etc/resolv.conf"                 2>/dev/null || true
+    cp -f /etc/hosts       "${overlay}/etc/hosts"                        2>/dev/null || true
     [[ -f /etc/pki/tls/certs/ca-bundle.crt ]] && \
         cp -f /etc/pki/tls/certs/ca-bundle.crt \
-              "${overlay}/etc/pki/tls/certs/ca-bundle.crt"                   2>/dev/null || true
+              "${overlay}/etc/pki/tls/certs/ca-bundle.crt"               2>/dev/null || true
     [[ -d /etc/pki/ca-trust ]] && \
-        cp -rf /etc/pki/ca-trust/. "${overlay}/etc/pki/ca-trust/"            2>/dev/null || true
-    log_ok "  Network config injected."
+        cp -rf /etc/pki/ca-trust/. "${overlay}/etc/pki/ca-trust/"        2>/dev/null || true
+    log_ok "  Overlay network config injected."
 
-    # ── 4. Test nspawn network — can the container reach the internet? ───────
-    log_info "  [4/5] Testing nspawn container network..."
-    local nspawn_net_ok=false
-    if systemd-nspawn --register=no --quiet -D "$overlay" \
-        curl -4 --silent --max-time 8 --head \
-        "https://repo.almalinux.org/almalinux/8/BaseOS/x86_64/os/repodata/repomd.xml" \
-        &>/dev/null 2>&1; then
-        nspawn_net_ok=true
-        log_ok "  nspawn network: WORKING — container can reach repos directly."
-    else
-        log_warn "  nspawn network: UNAVAILABLE — will use host-side bootstrap instead."
-    fi
+    # Layer F: host-side dnf bootstrap — pre-populate installroot from host
+    log_info "  [F] Running host-side EL8 bootstrap (pre-populates installroot)..."
+    _host_dnf_bootstrap "$overlay"
 
-    # ── 5. Host-side dnf bootstrap (the definitive bypass) ──────────────────
-    # Always run this if nspawn network doesn't work.
-    # Also run it even if nspawn CAN reach network, as a speed optimisation
-    # (pre-cached packages = faster leapp run).
-    if [[ "$nspawn_net_ok" == false ]]; then
-        log_info "  [5/5] Running host-side EL8 bootstrap (bypasses nspawn network)..."
-        _host_dnf_bootstrap "$overlay"
-    else
-        log_info "  [5/5] nspawn network OK — skipping host-side bootstrap."
-    fi
-
-    log_ok "nspawn remediation complete."
+    log_ok "nspawn remediation complete (all layers applied)."
 }
 
 phase_fix_inhibitors() {
@@ -1267,6 +1434,9 @@ phase_fix_inhibitors() {
 # ---------------------------------------------------------------------------
 # Phase 5: leapp preupgrade (with auto-retry + nspawn bypass)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 5: leapp preupgrade (with auto-retry + nspawn bypass)
+# ---------------------------------------------------------------------------
 phase_preupgrade() {
     log_section "Phase 5/6: leapp preupgrade (DRY RUN)"
 
@@ -1276,12 +1446,12 @@ phase_preupgrade() {
 
     log_info "This is a DRY RUN — no changes are made to the system."
 
-    # Strategy:
-    #   Attempt 1: run leapp preupgrade — this creates the nspawn overlay.
-    #              The overlay will fail to reach repos (nspawn v219 + KVM).
-    #   Between attempts: apply nspawn remediation (patch repos + host dnf bootstrap).
-    #   Attempt 2: leapp preupgrade — overlay already has packages, no network needed.
-    #   Attempt 3: if still failing, run full inhibitor remediation + retry.
+    # Apply layers A+B BEFORE the first preupgrade run.
+    # These prevent nspawn from stealing the host NIC — must happen before
+    # leapp ever spawns a container, not after the NIC is already gone.
+    log_info "Pre-flight: patching nspawn to prevent host network disruption..."
+    _patch_leapp_actor
+    _prevent_nspawn_network_namespace
 
     local max_attempts=4
     local attempt=0
@@ -1291,8 +1461,15 @@ phase_preupgrade() {
         ((attempt++)) || true
         log_info "leapp preupgrade — attempt $attempt/$max_attempts..."
 
+        # Verify network is up before each attempt
+        _restore_network
+
         local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
         "$LEAPP_BIN" preupgrade 2>&1 | tee "$plog" || true
+
+        # ALWAYS restore network after preupgrade — nspawn may have taken it down
+        log_info "Checking host network after preupgrade run..."
+        _restore_network
 
         if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
             log_error "leapp report not generated. See: $plog"
@@ -1317,28 +1494,24 @@ phase_preupgrade() {
 
         log_warn "Attempt $attempt: inhibitors=$inhibitor_count errors=$error_count"
 
-        # Detect the nspawn "Unable to install RHEL 8 userspace packages" error
+        # Detect nspawn "Unable to install RHEL 8 userspace packages" error
         local has_nspawn_error=false
-        if grep -q "Unable to install RHEL 8 userspace packages" \
-            /var/log/leapp/leapp-report.txt 2>/dev/null; then
-            has_nspawn_error=true
-        fi
+        grep -q "Unable to install RHEL 8 userspace packages" \
+            /var/log/leapp/leapp-report.txt 2>/dev/null && has_nspawn_error=true
 
         if [[ $attempt -lt $max_attempts ]]; then
             if [[ "$has_nspawn_error" == true ]] && [[ "$nspawn_fixed" == false ]]; then
-                log_info "── Detected nspawn repo failure. Applying nspawn remediation ──"
+                log_info "── Detected nspawn repo failure → applying full nspawn remediation ──"
                 fix_nspawn_network
                 nspawn_fixed=true
-                log_info "── Clearing leapp state for clean retry ──"
-                rm -rf /var/lib/leapp/storage 2>/dev/null || true
-                rm -f  /var/log/leapp/leapp-report.txt 2>/dev/null || true
             else
-                # Non-nspawn inhibitor or nspawn already fixed — run full remediation
                 log_info "── Running full inhibitor remediation (attempt $attempt) ──"
                 state_set "PHASE_INHIBITORS" ""
                 phase_fix_inhibitors
-                rm -f /var/log/leapp/leapp-report.txt 2>/dev/null || true
             fi
+            # Clear stale report and actor state so next run is fresh
+            rm -rf /var/lib/leapp/storage 2>/dev/null || true
+            rm -f  /var/log/leapp/leapp-report.txt 2>/dev/null || true
         else
             echo
             log_error "═══════════════════════════════════════════════════════════"
@@ -1351,7 +1524,7 @@ phase_preupgrade() {
             log_error "   (Migration will resume from this phase)"
             log_error "═══════════════════════════════════════════════════════════"
             echo
-            cat /var/log/leapp/leapp-report.txt
+            grep -E "^Risk Factor: high|^Title:" /var/log/leapp/leapp-report.txt 2>/dev/null || true
             die "leapp preupgrade blocked after $max_attempts attempts."
         fi
     done
@@ -1385,6 +1558,9 @@ phase_upgrade() {
     echo
 
     "$LEAPP_BIN" upgrade 2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log" || true
+
+    # Restore network if nspawn took it down during upgrade
+    _restore_network
 
     # Should not reach here normally
     log_info "leapp upgrade exited. Waiting for reboot..."
