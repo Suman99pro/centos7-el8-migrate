@@ -1,56 +1,65 @@
 # Changelog
 
-## [3.0.0] — 2026-03-13
+## [4.0.0] — 2026-03-15
 
-### Complete redesign
+### Complete rewrite — based on official ELevate procedure
 
-**Architecture**
-- Removed `set -e` / `set -euo pipefail` global scope — script no longer dies on non-zero exit
-- Errors collected into categorised arrays (BLOCK / WARN / AUTO-FIX / INFO / PASS) instead of immediately terminating
-- Phase-based execution with state persistence — failed/interrupted migrations resume from last completed phase
-- Four distinct modes: `assess`, `fix`, `migrate`, `post-upgrade`
-- Interactive main menu with migration progress display
+**Why:** Previous versions (1.x–3.x) accumulated layers of workarounds
+that were masking the real issues. This version starts from the official
+AlmaLinux ELevate guide and adds only the automations that are genuinely
+needed for a CentOS 7 Core/minimal install.
 
-**Assessment phase (new)**
-- Completely non-destructive read-only preflight check
-- Colour-coded report: ✔ PASS / ℹ INFO / ⚙ AUTO-FIX / ⚠ WARN / ✖ BLOCK
-- GO / NO-GO / PROCEED WITH CAUTION verdict
-- Exit codes: 0=go, 1=warnings, 2=blockers (CI-friendly)
-- Saves report to `/var/log/el8-migration/preflight_report_TIMESTAMP.txt`
+### What changed
 
-**Auto-fix phase (new)**
-- Separate `--fix` mode applies only safe, non-destructive remediations
-- Also runs automatically before migration if auto-fixable issues found
+- Script now follows official procedure from
+  https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html
+  step for step — no deviation from the documented path
 
-**Migration wizard**
-- Runs preflight first — blocks if any BLOCK findings exist
-- Each phase is individually confirmable and resumable
-- State saved to `/var/log/el8-migration/.migration_state`
+- **CentOS 7 EOL repo fix:** added as Step 1 — official fix from AlmaLinux wiki
+  (`curl -o /etc/yum.repos.d/CentOS-Base.repo https://el7.repo.almalinux.org/...`)
 
-### Bug fixes carried forward from v2.x
+- **NIC protection:** `systemd-nspawn` binary wrapper injects `--network-none`
+  unconditionally — prevents host NIC from being moved into container namespace
+  (systemd v219 bug, confirmed in issue #4330)
 
-- **IPv6**: Detects broken IPv6 and disables via `sysctl` before leapp runs — prevents `Unable to install RHEL 8 userspace packages` error from leapp nspawn repo failures
-- **ABRT cascade removal**: Uses `--setopt=clean_requirements_on_remove=0` — prevents yum from cascade-removing `leapp-upgrade-el7toel8` via `libreport` dependency
-- **leapp binary resolver**: 6-stage resolver (known paths → PATH → filesystem search → RPM file lists → install provider packages → diagnostic dump)
-- **leapp framework package**: Explicitly installs `leapp` RPM (binary provider) separately from `leapp-upgrade-el7toel8` (actors/data provider)
-- **leapp repo disabled by default**: Always force-enables the elevate repo after installing elevate-release RPM
-- **Rocky Linux EPEL**: Enables CRB repo before EPEL install on Rocky Linux
+- **subscription-manager:** sets `LEAPP_NO_RHSM=1` + `manage_repos=0` in
+  `/etc/rhsm/rhsm.conf` + creates stub binary if absent — covers all leapp
+  versions including pre-PR#1133 builds that require binary presence
+
+- **EL8 installroot bootstrap:** pre-populates installroot from host when nspawn
+  network fails (correct fix, not a workaround)
+
+- **NIC watchdog:** background process restores NIC if it goes DOWN during
+  preupgrade — only monitors real NICs, never touches virbr/veth/docker
+
+- Removed all the accumulated complexity from v3.x that was not solving the
+  root causes
+
+### Removed
+- All the custom assessment/menu/state-machine infrastructure from v3.x
+- Multiple duplicate fix functions
+- All the ad-hoc workarounds that weren't addressing root causes
 
 ---
 
-## [2.0.0] — 2026-03-12
+## [3.x] — 2026-03-13 to 2026-03-14
 
-- Universal leapp inhibitor remediation engine
-- Dynamic driver blacklisting from leapp-report.txt
-- leapp answerfile pre-population for all known interactive prompts
-- IPv6 detection and disabling (Step 10)
-- ABRT safe removal (no autoremove)
-- leapp binary resolver (initial version)
-- Rocky Linux 8 full support audit
+Iterative debugging session. Multiple attempts to fix:
+- nspawn network failures (python regex patching — unreliable)
+- subscription-manager (removal approach — wrong)
+- CentOS 7 EOL repos (not addressed early enough)
 
-## [1.0.0] — 2026-03-11
+---
+
+## [2.0.0] — 2026-03-13
+
+- Added Rocky Linux support
+- Added leapp inhibitor auto-remediation
+- Added backup phase
+
+---
+
+## [1.0.0] — 2026-03-13
 
 - Initial release
-- Phase 1–5 migration flow
-- DD backup with MD5 verification
-- Post-upgrade validation
+- Basic CentOS 7 → AlmaLinux 8 automation

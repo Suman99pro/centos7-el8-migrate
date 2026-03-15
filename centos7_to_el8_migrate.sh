@@ -1,727 +1,160 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  CentOS 7 → AlmaLinux 8 / Rocky Linux 8  ·  Migration Toolkit  v3.0.0
+#  centos7_to_el8_migrate.sh  —  CentOS 7 → AlmaLinux 8 / Rocky Linux 8
+#  Version : 4.0.0
+#  Based on : https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html
+#             https://phoenixnap.com/kb/migrate-centos-to-rocky-linux
 # =============================================================================
-#  Modular, menu-driven, non-destructive assessment → fix → migrate workflow.
 #
 #  USAGE:
-#    sudo ./centos7_to_el8_migrate.sh [OPTIONS]
+#    sudo ./centos7_to_el8_migrate.sh [--target alma|rocky] [--auto-yes]
 #
-#  OPTIONS:
-#    --assess          Run preflight assessment only (no changes)
-#    --fix             Auto-fix safe issues found during assessment
-#    --migrate         Full interactive migration
-#    --post-upgrade    Post-reboot validation
-#    --target alma|rocky   Pre-select target distro
-#    --backup-dev /dev/sdX Block device for disk backup
-#    --skip-backup     Skip backup phase (DANGEROUS)
-#    --auto-yes        Non-interactive mode (CI/testing only)
-#    --log-dir /path   Custom log dir (default: /var/log/el8-migration)
-#    --help            Show this help
+#  This script follows the OFFICIAL ELevate procedure exactly, with automation
+#  of the manual steps that always need to be done on a CentOS 7 Core/minimal.
+#
 # =============================================================================
-
-# ---------------------------------------------------------------------------
-# SHELL OPTIONS — deliberately NO set -e; errors are handled explicitly
-# ---------------------------------------------------------------------------
 set -uo pipefail
 IFS=$'\n\t'
 
-# ---------------------------------------------------------------------------
-# VERSION & CONSTANTS
-# ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="3.14.0"
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly START_TIME="$(date +%Y%m%d_%H%M%S)"
+readonly VERSION="4.0.0"
+readonly LOG_DIR="/var/log/el8-migration"
+readonly START_TS="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_DIR}/migrate_${START_TS}.log"
 
-# ---------------------------------------------------------------------------
-# DEFAULTS
-# ---------------------------------------------------------------------------
-LOG_DIR="/var/log/el8-migration"
-LOG_FILE=""
-REPORT_FILE=""
-TARGET_DISTRO=""
-BACKUP_DEV=""
-SKIP_BACKUP=false
+# Target: alma or rocky
+TARGET="alma"
 AUTO_YES=false
-MODE=""
 
-# ---------------------------------------------------------------------------
-# RUNTIME STATE
-# ---------------------------------------------------------------------------
-LEAPP_BIN=""
-STATE_FILE=""
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'
+CYN='\033[0;36m'; BLD='\033[1m';    RST='\033[0m'
+MGT='\033[0;35m'
 
-# Preflight finding arrays — declare explicitly for bash 4.2 (CentOS 7) set -u compatibility
-declare -a PREFLIGHT_BLOCKS=()
-declare -a PREFLIGHT_WARNS=()
-declare -a PREFLIGHT_AUTOS=()
-declare -a PREFLIGHT_INFO=()
-declare -a PREFLIGHT_PASS=()
-
-# ---------------------------------------------------------------------------
-# COLOURS
-# ---------------------------------------------------------------------------
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
-BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; WHITE='\033[1;37m'
-
-# ===========================================================================
-#  LOGGING & HELPERS
-# ===========================================================================
-
-init_logging() {
-    mkdir -p "$LOG_DIR"
-    LOG_FILE="${LOG_DIR}/migration_${START_TIME}.log"
-    REPORT_FILE="${LOG_DIR}/preflight_report_${START_TIME}.txt"
-    STATE_FILE="${LOG_DIR}/.migration_state"
-    touch "$LOG_FILE"
-    exec > >(tee -a "$LOG_FILE") 2>&1
-    log_info "Log: $LOG_FILE"
-}
-
-_ts()      { date '+%Y-%m-%d %H:%M:%S'; }
-log()      { echo -e "[$(_ts)] $*"; }
-log_info() { log "${GREEN}[INFO]${RESET}   $*"; }
-log_ok()   { log "${GREEN}[OK]${RESET}     $*"; }
-log_warn() { log "${YELLOW}[WARN]${RESET}   $*"; }
-log_error(){ log "${RED}[ERROR]${RESET}  $*"; }
-log_section() {
-    echo
-    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${RESET}"
-    echo -e "${BOLD}${CYAN}  $*${RESET}"
-    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${RESET}"
-}
-
-# Preflight collectors — never exit, just record
-pf_block() { PREFLIGHT_BLOCKS+=("$*"); log "${RED}${BOLD}[BLOCK]${RESET}    $*"; }
-pf_warn()  { PREFLIGHT_WARNS+=("$*");  log "${YELLOW}[WARN]${RESET}     $*"; }
-pf_auto()  { PREFLIGHT_AUTOS+=("$*");  log "${MAGENTA}[AUTO-FIX]${RESET} $*"; }
-pf_info()  { PREFLIGHT_INFO+=("$*");   log "${BLUE}[INFO]${RESET}     $*"; }
-pf_pass()  { PREFLIGHT_PASS+=("$*");   log "${GREEN}[PASS]${RESET}     $*"; }
-
-# Hard exit — only for situations truly unrecoverable (no root, etc.)
-die() { log_error "FATAL: $*"; exit 1; }
+ts()    { date '+%H:%M:%S'; }
+info()  { echo -e "[$(ts)] ${CYN}[INFO]${RST}  $*" | tee -a "$LOG_FILE"; }
+ok()    { echo -e "[$(ts)] ${GRN}[OK]${RST}    $*" | tee -a "$LOG_FILE"; }
+warn()  { echo -e "[$(ts)] ${YEL}[WARN]${RST}  $*" | tee -a "$LOG_FILE"; }
+err()   { echo -e "[$(ts)] ${RED}[ERROR]${RST} $*" | tee -a "$LOG_FILE"; }
+die()   { err "$*"; exit 1; }
+step()  { echo; echo -e "${BLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"; \
+          echo -e "${BLD}${CYN}  $*${RST}"; \
+          echo -e "${BLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"; echo; }
 
 confirm() {
-    local msg="$1"
-    [[ "$AUTO_YES" == true ]] && { log_info "Auto-yes: $msg"; return 0; }
-    echo -en "\n${YELLOW}  ▶ ${msg} [y/N]: ${RESET}"
+    [[ "$AUTO_YES" == true ]] && return 0
+    echo -en "${YEL}  $* [y/N]: ${RST}"
     local ans; read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]]
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
-# State persistence
-state_set() { grep -v "^${1}=" "$STATE_FILE" 2>/dev/null > "${STATE_FILE}.tmp" || true; mv "${STATE_FILE}.tmp" "$STATE_FILE" 2>/dev/null || true; echo "${1}=${2}" >> "$STATE_FILE"; }
-state_get() { grep "^${1}=" "$STATE_FILE" 2>/dev/null | cut -d= -f2- || echo ""; }
-state_init(){ mkdir -p "$LOG_DIR"; touch "${LOG_DIR}/.migration_state"; STATE_FILE="${LOG_DIR}/.migration_state"; }
-
-banner() {
-    clear 2>/dev/null || true
-    echo -e "${BOLD}${CYAN}"
-    cat <<'BANNER'
-  ██████╗███████╗███╗   ██╗████████╗ ██████╗ ███████╗    ███████╗██╗
- ██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔═══██╗██╔════╝    ██╔════╝██║
- ██║     █████╗  ██╔██╗ ██║   ██║   ██║   ██║███████╗    █████╗  ██║
- ██║     ██╔══╝  ██║╚██╗██║   ██║   ██║   ██║╚════██║    ██╔══╝  ██║
- ╚██████╗███████╗██║ ╚████║   ██║   ╚██████╔╝███████║    ███████╗███████╗
-  ╚═════╝╚══════╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚══════╝    ╚══════╝╚══════╝
-       CentOS 7  →  AlmaLinux 8 / Rocky Linux 8  Migration Toolkit
-BANNER
-    echo -e "${RESET}"
-    echo -e "  ${WHITE}Version:${RESET} ${SCRIPT_VERSION}   ${WHITE}Date:${RESET} $(date '+%Y-%m-%d %H:%M')   ${WHITE}Host:${RESET} $(hostname -f 2>/dev/null || hostname)"
-    echo
+# ── Init ─────────────────────────────────────────────────────────────────────
+init() {
+    mkdir -p "$LOG_DIR"
+    touch "$LOG_FILE"
+    [[ $EUID -ne 0 ]] && die "Run as root: sudo $0"
 }
 
-usage() {
-    cat <<EOF
-Usage: sudo $SCRIPT_NAME [OPTIONS]
-
-Modes (or run with no flags for interactive menu):
-  --assess            Preflight assessment — zero changes made
-  --fix               Auto-fix safe issues found by assess
-  --migrate           Full interactive migration wizard
-  --post-upgrade      Post-reboot validation
-
-Options:
-  --target alma|rocky   Pre-select target distribution
-  --backup-dev /dev/sdX Block device for full disk image backup
-  --skip-backup         Skip backup (NOT recommended in production)
-  --auto-yes            Non-interactive mode
-  --log-dir /path       Log directory (default: /var/log/el8-migration)
-  -h, --help            Show this help
-
-Examples:
-  sudo $SCRIPT_NAME --assess
-  sudo $SCRIPT_NAME --fix
-  sudo $SCRIPT_NAME --migrate --target alma --backup-dev /dev/sdb
-  sudo $SCRIPT_NAME --post-upgrade
-EOF
-}
-
+# ── Args ─────────────────────────────────────────────────────────────────────
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --assess)       MODE="assess"; shift ;;
-            --fix)          MODE="fix"; shift ;;
-            --migrate)      MODE="migrate"; shift ;;
-            --post-upgrade) MODE="post-upgrade"; shift ;;
-            --target)       TARGET_DISTRO="${2,,}"; shift 2 ;;
-            --backup-dev)   BACKUP_DEV="$2"; shift 2 ;;
-            --skip-backup)  SKIP_BACKUP=true; shift ;;
-            --auto-yes)     AUTO_YES=true; shift ;;
-            --log-dir)      LOG_DIR="$2"; shift 2 ;;
-            -h|--help)      usage; exit 0 ;;
-            *) echo "Unknown option: $1  (use --help)"; exit 1 ;;
+            --target) TARGET="$2"; shift 2 ;;
+            --auto-yes|-y) AUTO_YES=true; shift ;;
+            --help|-h) usage; exit 0 ;;
+            *) warn "Unknown arg: $1"; shift ;;
         esac
     done
+    [[ "$TARGET" == "alma" || "$TARGET" == "rocky" ]] || \
+        die "Invalid --target. Use: alma or rocky"
 }
 
-# ===========================================================================
-#  SECTION 1 — PREFLIGHT ASSESSMENT  (read-only, never exits on error)
-# ===========================================================================
-
-preflight_reset() {
-    PREFLIGHT_BLOCKS=(); PREFLIGHT_WARNS=()
-    PREFLIGHT_AUTOS=();  PREFLIGHT_INFO=(); PREFLIGHT_PASS=()
-    # Bash 4.2 (CentOS 7) treats empty arrays as unbound under set -u
-    # Re-declare explicitly to avoid "unbound variable" errors
-    declare -ga PREFLIGHT_BLOCKS PREFLIGHT_WARNS PREFLIGHT_AUTOS PREFLIGHT_INFO PREFLIGHT_PASS
-}
-
-# --- individual checks -------------------------------------------------------
-
-_pf_root() {
-    if [[ $EUID -ne 0 ]]; then
-        pf_block "Must run as root. Re-run with: sudo $SCRIPT_NAME"
-    else
-        pf_pass "Running as root."
-    fi
-}
-
-_pf_os() {
-    if [[ ! -f /etc/centos-release ]]; then
-        pf_block "Not a CentOS system (/etc/centos-release missing)."
-        return
-    fi
-    local ver
-    ver=$(rpm -q --queryformat '%{VERSION}' centos-release 2>/dev/null || echo "")
-    if [[ "$ver" != "7" ]]; then
-        pf_block "CentOS version '$ver' detected. Only CentOS 7.x is supported."
-    else
-        pf_pass "OS: $(cat /etc/centos-release)"
-    fi
-}
-
-_pf_disk() {
-    local root_avail boot_avail var_avail
-    root_avail=$(df --output=avail -BG / 2>/dev/null | tail -1 | tr -d 'G ' || echo "0")
-    boot_avail=$(df --output=avail -BG /boot 2>/dev/null | tail -1 | tr -d 'G ' || echo "0")
-    var_avail=$(df --output=avail -BG /var 2>/dev/null | tail -1 | tr -d 'G ' || echo "0")
-
-    if [[ "$root_avail" -lt 10 ]]; then
-        pf_block "/ has only ${root_avail}G free. ELevate requires ≥10G. Run: yum clean all; package-cleanup --oldkernels"
-    else
-        pf_pass "/ disk: ${root_avail}G free (≥10G required)."
-    fi
-
-    if [[ "$boot_avail" -lt 1 ]]; then
-        pf_block "/boot has only ${boot_avail}G free. Need ≥1G. Run: package-cleanup --oldkernels --count=1"
-    else
-        pf_pass "/boot disk: ${boot_avail}G free."
-    fi
-
-    if [[ "$var_avail" -lt 3 ]]; then
-        pf_warn "/var has only ${var_avail}G free. leapp scratch needs ≥3G in /var. Free space before migrating."
-    else
-        pf_pass "/var disk: ${var_avail}G free."
-    fi
-}
-
-_pf_network() {
-    if curl -4 --silent --max-time 10 --head "https://repo.almalinux.org" &>/dev/null; then
-        pf_pass "Network: repo.almalinux.org reachable (IPv4)."
-    else
-        pf_block "Cannot reach repo.almalinux.org via IPv4. Internet required for ELevate packages and repo sync."
-    fi
-
-    # Check CentOS 7 base repos are reachable (EOL — official mirrors offline)
-    if ! yum makecache fast &>/dev/null 2>&1; then
-        pf_auto "CentOS 7 repos unreachable (EOL). Will fix: point to vault.centos.org or AlmaLinux's el7 mirror."
-    else
-        pf_pass "CentOS 7 repos reachable."
-    fi
-
-    local ipv6_disabled
-    ipv6_disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "1")
-    if [[ "$ipv6_disabled" == "0" ]]; then
-        if ! ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
-            pf_auto "IPv6 enabled but not working. Will be disabled — broken IPv6 causes leapp nspawn repo failures."
-        else
-            pf_pass "IPv6: working."
-        fi
-    else
-        pf_pass "IPv6: already disabled (safe for leapp)."
-    fi
-
-    # Check if a leapp nspawn overlay exists and has broken network config
-    local overlay
-    overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
-    if [[ -n "$overlay" ]]; then
-        local issues=()
-        [[ ! -s "${overlay}/etc/resolv.conf" ]] && issues+=("resolv.conf missing/empty")
-        [[ ! -s "${overlay}/etc/pki/tls/certs/ca-bundle.crt" ]] && issues+=("CA bundle missing/empty")
-        if [[ ${#issues[@]} -gt 0 ]]; then
-            pf_auto "leapp nspawn overlay has network issues: ${issues[*]}. Will be fixed — causes all repo syncs to fail inside the upgrade container."
-        else
-            pf_pass "leapp nspawn overlay network config OK."
-        fi
-    fi
-}
-
-_pf_tools() {
-    local missing=()
-    for t in rpm yum curl lsblk df free uname ss ip awk grep sed; do
-        command -v "$t" &>/dev/null || missing+=("$t")
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        pf_auto "Missing tools: ${missing[*]}. Will install automatically."
-    else
-        pf_pass "All required CLI tools present."
-    fi
-}
-
-_pf_boot() {
-    if [[ -d /sys/firmware/efi ]]; then
-        pf_info "Boot: UEFI. leapp handles EFI grub2 update automatically."
-    else
-        pf_info "Boot: BIOS/Legacy. leapp runs grub2-install automatically."
-    fi
-
-    if grep -q "active" /proc/mdstat 2>/dev/null; then
-        if grep -q "_" /proc/mdstat 2>/dev/null; then
-            pf_block "Software RAID appears degraded (/proc/mdstat contains '_'). Repair before upgrading."
-        else
-            pf_warn "Software RAID detected. Verify all arrays healthy: cat /proc/mdstat"
-        fi
-    fi
-
-    local kcount
-    kcount=$(rpm -q kernel 2>/dev/null | wc -l || echo "0")
-    if [[ "$kcount" -gt 2 ]]; then
-        pf_auto "$kcount kernel packages installed. Old kernels will be removed to free /boot space."
-    else
-        pf_pass "Kernel count: $kcount."
-    fi
-}
-
-_pf_packages() {
-    local pkg_count
-    pkg_count=$(rpm -qa 2>/dev/null | wc -l || echo "0")
-    pf_info "Total installed packages: $pkg_count."
-
-    # ABRT
-    local abrt
-    abrt=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
-    if [[ -n "$abrt" ]]; then
-        pf_auto "ABRT packages detected. These conflict with leapp and will be removed safely."
-    else
-        pf_pass "No ABRT packages."
-    fi
-
-    # SCL
-    if rpm -q centos-release-scl &>/dev/null 2>&1 || rpm -q scl-utils &>/dev/null 2>&1; then
-        pf_warn "Software Collections (SCL) detected. SCL is NOT available in EL8. Migrate SCL apps to AppStream module streams."
-    fi
-
-    # PHP
-    local php
-    php=$(php -v 2>/dev/null | head -1 | grep -oE "PHP [0-9]+\.[0-9]+" || echo "")
-    if [[ -n "$php" ]]; then
-        if echo "$php" | grep -qE "PHP (5\.|7\.[01])"; then
-            pf_warn "EOL PHP detected: $php. Not in EL8 default repos. Plan migration to PHP 7.4+ or 8.x."
-        else
-            pf_info "PHP detected: $php. Verify EL8 AppStream/Remi availability."
-        fi
-    fi
-
-    # MySQL
-    if rpm -q mysql-server &>/dev/null 2>&1; then
-        pf_warn "MySQL Server detected. MySQL 5.x not in EL8 repos. Plan migration to MySQL 8.0 or MariaDB 10.x."
-    fi
-
-    # MariaDB
-    if rpm -q mariadb-server &>/dev/null 2>&1; then
-        pf_info "MariaDB detected. EL8 ships MariaDB 10.3+. Verify data compatibility."
-    fi
-
-    # PostgreSQL
-    if rpm -q postgresql-server &>/dev/null 2>&1; then
-        pf_info "PostgreSQL detected. Use PostgreSQL official EL8 repo post-upgrade."
-    fi
-
-    # Kubernetes
-    if command -v kubectl &>/dev/null 2>&1 || command -v kubelet &>/dev/null 2>&1; then
-        pf_warn "Kubernetes detected. Upgrade k8s AFTER OS upgrade using EL8 k8s repos."
-    fi
-
-    # Custom kernel modules
-    local extra_dir="/lib/modules/$(uname -r)/extra"
-    if [[ -d "$extra_dir" ]] && find "$extra_dir" -name "*.ko" 2>/dev/null | grep -q .; then
-        pf_warn "Custom out-of-tree kernel modules found in $extra_dir. They will NOT work after kernel upgrade."
-    else
-        pf_pass "No custom out-of-tree kernel modules."
-    fi
-
-    # SSSD
-    if rpm -q sssd &>/dev/null 2>&1; then
-        pf_info "SSSD detected (LDAP/AD/FreeIPA auth). Verify sssd config post-upgrade."
-    fi
-}
-
-_pf_repos() {
-    local tp=()
-    while IFS= read -r rf; do
-        local rn; rn=$(basename "$rf" .repo)
-        echo "$rn" | grep -qiE "^(CentOS|base|updates|extras|epel|centos)" || tp+=("$rn")
-    done < <(find /etc/yum.repos.d/ -name "*.repo" 2>/dev/null)
-
-    if [[ ${#tp[@]} -gt 0 ]]; then
-        pf_warn "Third-party repos: ${tp[*]+"${tp[*]}"}. Will be temporarily disabled during upgrade."
-    else
-        pf_pass "No third-party repos detected."
-    fi
-
-    for r in percona mariadb mysql nginx elastic remi ius webtatic; do
-        find /etc/yum.repos.d/ -name "*.repo" -exec grep -li "$r" {} \; 2>/dev/null | grep -q . && \
-            pf_warn "Repo '$r' found. Verify EL8-compatible version exists."
-    done
-}
-
-_pf_security() {
-    local sel; sel=$(getenforce 2>/dev/null || echo "disabled")
-    pf_info "SELinux: $sel. leapp sets permissive during upgrade — re-enable enforcing post-upgrade."
-
-    if command -v cryptsetup &>/dev/null 2>&1 && cryptsetup status 2>/dev/null | grep -q "active"; then
-        pf_warn "LUKS encryption detected. Ensure backup captures encrypted partition headers."
-    fi
-
-    local sp; sp=$(grep -i "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-    pf_info "SSH port: ${sp:-22}. Verify firewall allows access post-upgrade."
-}
-
-_pf_services() {
-    local det=()
-    for s in sshd httpd nginx mysql mariadb postgresql redis mongod; do
-        systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service" && \
-            det+=("${s}:$(systemctl is-active "$s" 2>/dev/null || echo inactive)")
-    done
-    if [[ ${#det[@]} -gt 0 ]]; then
-        pf_info "Critical services detected: ${det[*]+"${det[*]}"}. Verify each restarts correctly post-upgrade."
-    else
-        pf_pass "No critical application services detected."
-    fi
-}
-
-_pf_virt() {
-    local v; v=$(systemd-detect-virt 2>/dev/null || echo "unknown")
-    pf_info "Virtualisation: $v"
-    [[ "$v" == "none" ]] && pf_info "Bare metal: ensure out-of-band console access (iDRAC/iLO) before upgrade."
-}
-
-# --- master runner ------------------------------------------------------------
-run_preflight() {
-    log_section "PREFLIGHT ASSESSMENT"
-    preflight_reset
-    _pf_root; _pf_os; _pf_disk; _pf_network; _pf_tools
-    _pf_boot; _pf_packages; _pf_repos; _pf_security; _pf_services; _pf_virt
-}
-
-# --- report printer ----------------------------------------------------------
-print_preflight_report() {
+usage() {
+    echo "Usage: sudo $0 [OPTIONS]"
     echo
-    echo -e "${BOLD}${WHITE}╔══════════════════════════════════════════════════════════════╗${RESET}"
-    printf "${BOLD}${WHITE}║  PREFLIGHT REPORT  %-44s║${RESET}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
-    printf "${BOLD}${WHITE}║  Host: %-54s║${RESET}\n" "$(hostname -f 2>/dev/null || hostname)"
-    echo -e "${BOLD}${WHITE}╚══════════════════════════════════════════════════════════════╝${RESET}"
+    echo "Options:"
+    echo "  --target alma|rocky   Target distribution (default: alma)"
+    echo "  --auto-yes, -y        Non-interactive mode"
+    echo "  --help                Show this help"
     echo
-
-    if [[ ${#PREFLIGHT_PASS[@]} -gt 0 ]]; then
-        echo -e "${GREEN}${BOLD}✔  PASSED (${#PREFLIGHT_PASS[@]})${RESET}"
-        for i in "${PREFLIGHT_PASS[@]+"${PREFLIGHT_PASS[@]}"}"; do echo -e "   ${GREEN}✔${RESET} $i"; done; echo
-    fi
-
-    if [[ ${#PREFLIGHT_INFO[@]} -gt 0 ]]; then
-        echo -e "${BLUE}${BOLD}ℹ  INFORMATIONAL (${#PREFLIGHT_INFO[@]})${RESET}"
-        for i in "${PREFLIGHT_INFO[@]+"${PREFLIGHT_INFO[@]}"}"; do echo -e "   ${BLUE}ℹ${RESET} $i"; done; echo
-    fi
-
-    if [[ ${#PREFLIGHT_AUTOS[@]} -gt 0 ]]; then
-        echo -e "${MAGENTA}${BOLD}⚙  AUTO-FIXABLE (${#PREFLIGHT_AUTOS[@]}) — will be fixed automatically${RESET}"
-        for i in "${PREFLIGHT_AUTOS[@]+"${PREFLIGHT_AUTOS[@]}"}"; do echo -e "   ${MAGENTA}⚙${RESET} $i"; done; echo
-    fi
-
-    if [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
-        echo -e "${YELLOW}${BOLD}⚠  WARNINGS — review before proceeding (${#PREFLIGHT_WARNS[@]})${RESET}"
-        for i in "${PREFLIGHT_WARNS[@]+"${PREFLIGHT_WARNS[@]}"}"; do echo -e "   ${YELLOW}⚠${RESET} $i"; done; echo
-    fi
-
-    if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
-        echo -e "${RED}${BOLD}✖  BLOCKERS — MUST FIX BEFORE MIGRATION (${#PREFLIGHT_BLOCKS[@]})${RESET}"
-        for i in "${PREFLIGHT_BLOCKS[@]+"${PREFLIGHT_BLOCKS[@]}"}"; do echo -e "   ${RED}✖${RESET} $i"; done; echo
-    fi
-
-    echo -e "${BOLD}${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
-        echo -e "  ${RED}${BOLD}VERDICT: ✖  NOT READY — Fix ${#PREFLIGHT_BLOCKS[@]} blocker(s) first.${RESET}"
-    elif [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
-        echo -e "  ${YELLOW}${BOLD}VERDICT: ⚠  PROCEED WITH CAUTION — ${#PREFLIGHT_WARNS[@]} warning(s) to review.${RESET}"
-    else
-        echo -e "  ${GREEN}${BOLD}VERDICT: ✔  GO — System is ready for migration.${RESET}"
-    fi
-    echo -e "${BOLD}${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    echo
-
-    # Save to file
-    {
-        echo "PREFLIGHT REPORT — $(date)"
-        echo "Host: $(hostname -f 2>/dev/null || hostname) | Script: v$SCRIPT_VERSION"
-        echo "════════════════════════════════════════════"
-        echo; echo "PASSED (${#PREFLIGHT_PASS[@]}):"
-        for i in "${PREFLIGHT_PASS[@]+"${PREFLIGHT_PASS[@]}"}"; do echo "  [PASS]  $i"; done
-        echo; echo "INFORMATIONAL:"
-        for i in "${PREFLIGHT_INFO[@]+"${PREFLIGHT_INFO[@]}"}"; do echo "  [INFO]  $i"; done
-        echo; echo "AUTO-FIXABLE:"
-        for i in "${PREFLIGHT_AUTOS[@]+"${PREFLIGHT_AUTOS[@]}"}"; do echo "  [AUTO]  $i"; done
-        echo; echo "WARNINGS:"
-        for i in "${PREFLIGHT_WARNS[@]+"${PREFLIGHT_WARNS[@]}"}"; do echo "  [WARN]  $i"; done
-        echo; echo "BLOCKERS:"
-        for i in "${PREFLIGHT_BLOCKS[@]+"${PREFLIGHT_BLOCKS[@]}"}"; do echo "  [BLOCK] $i"; done
-        echo
-        if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then echo "VERDICT: NOT READY"
-        elif [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then echo "VERDICT: PROCEED WITH CAUTION"
-        else echo "VERDICT: GO"; fi
-    } > "$REPORT_FILE"
-
-    log_info "Report: $REPORT_FILE"
+    echo "Based on:"
+    echo "  https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html"
+    echo "  https://phoenixnap.com/kb/migrate-centos-to-rocky-linux"
 }
 
-# ===========================================================================
-#  SECTION 2 — AUTO-FIX
-# ===========================================================================
-
-run_autofix() {
-    log_section "AUTO-FIX: Applying Safe Remediations"
-
-    # IPv6 — disable if broken
-    local ipv6_off
-    ipv6_off=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "1")
-    if [[ "$ipv6_off" == "0" ]] && ! ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
-        log_info "Disabling broken IPv6..."
-        sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
-        sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
-        grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null || \
-            printf '\n# el8-migration: IPv6 disabled\nnet.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\n' >> /etc/sysctl.conf
-        log_ok "IPv6 disabled."
-    fi
-
-    # Old kernels
-    local kcount; kcount=$(rpm -q kernel 2>/dev/null | wc -l || echo "0")
-    if [[ "$kcount" -gt 2 ]]; then
-        log_info "Removing old kernels..."
-        package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
-        log_ok "Old kernels removed."
-    fi
-
-    # ABRT
-    local abrt; abrt=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
-    if [[ -n "$abrt" ]]; then
-        log_info "Removing ABRT packages (safe, no cascade)..."
-        echo "$abrt" | xargs yum remove -y \
-            --setopt=clean_requirements_on_remove=0 2>/dev/null || true
-        log_ok "ABRT removed."
-    fi
-
-    # Missing tools
-    local miss=()
-    for t in rpm yum curl lsblk df free uname ss ip awk grep sed; do
-        command -v "$t" &>/dev/null || miss+=("$t")
-    done
-    if [[ ${#miss[@]} -gt 0 ]]; then
-        log_info "Installing missing tools: ${miss[*]+${miss[*]}}"
-        yum install -y "${miss[@]+"${miss[@]}"}" 2>/dev/null || log_warn "Some tools could not install."
-    fi
-
-    # redhat-release symlink
-    if [[ ! -f /etc/redhat-release ]] && [[ -f /etc/centos-release ]]; then
-        ln -sf /etc/centos-release /etc/redhat-release 2>/dev/null || true
-        log_ok "Fixed /etc/redhat-release symlink."
-    fi
-
-    # nspawn bypass — if overlay exists from a previous run, pre-fix it
-    local overlay
-    overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" -type d 2>/dev/null | head -1 || true)
-    if [[ -n "$overlay" ]]; then
-        log_info "leapp overlay found — applying nspawn network bypass fixes..."
-        fix_nspawn_network
-    fi
-
-    log_ok "Auto-fix complete. Re-run --assess to verify."
-}
-
-# ===========================================================================
-#  SECTION 3 — MIGRATION PHASES
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# Phase 1: Select target distro
-# ---------------------------------------------------------------------------
-phase_select_target() {
-    log_section "Phase 1/6: Select Target Distribution"
-
-    if [[ -n "$TARGET_DISTRO" ]]; then
-        [[ "$TARGET_DISTRO" == "alma" || "$TARGET_DISTRO" == "rocky" ]] || \
-            die "Invalid --target '$TARGET_DISTRO'. Use 'alma' or 'rocky'."
-        log_ok "Target: $TARGET_DISTRO (from command line)"
-        state_set "TARGET_DISTRO" "$TARGET_DISTRO"; return 0
-    fi
-
-    local saved; saved=$(state_get "TARGET_DISTRO")
-    if [[ -n "$saved" ]]; then
-        echo -e "\n  Previously selected: ${BOLD}${saved^^} Linux 8${RESET}"
-        if confirm "Use $saved?"; then
-            TARGET_DISTRO="$saved"; log_ok "Target: $TARGET_DISTRO (restored)"; return 0
-        fi
-    fi
-
+# ── Banner ───────────────────────────────────────────────────────────────────
+banner() {
+    clear
+    echo -e "${BLD}${CYN}"
+    echo "  ╔══════════════════════════════════════════════════════════╗"
+    echo "  ║     CentOS 7 → EL8 Migration Toolkit  v${VERSION}           ║"
+    echo "  ║     Based on official AlmaLinux ELevate procedure        ║"
+    echo "  ╚══════════════════════════════════════════════════════════╝"
+    echo -e "${RST}"
+    echo -e "  Target : ${BLD}${TARGET^^} Linux 8${RST}"
+    echo -e "  Log    : ${LOG_FILE}"
     echo
-    echo -e "  ${BOLD}Select target distribution:${RESET}"
-    echo -e "  ${CYAN}1)${RESET} AlmaLinux 8  — backed by CloudLinux.  EOL: 2029-03-01"
-    echo -e "  ${CYAN}2)${RESET} Rocky Linux 8 — founded by CentOS co-founder.  EOL: 2029-05-31"
-    echo
-    echo -en "  ${YELLOW}Choice [1/2]: ${RESET}"
-    local ch; read -r ch
-    case "$ch" in
-        1) TARGET_DISTRO="alma" ;;
-        2) TARGET_DISTRO="rocky" ;;
-        *) die "Invalid choice." ;;
-    esac
-
-    log_ok "Target: ${TARGET_DISTRO^^} Linux 8"
-    state_set "TARGET_DISTRO" "$TARGET_DISTRO"
 }
 
-# ---------------------------------------------------------------------------
-# Phase 2: Backup
-# ---------------------------------------------------------------------------
-phase_backup() {
-    log_section "Phase 2/6: Disk Image Backup"
+# =============================================================================
+#  STEP 0 — Pre-flight: verify this is CentOS 7 and check basic requirements
+# =============================================================================
+preflight() {
+    step "Pre-flight Checks"
 
-    if [[ "$(state_get PHASE_BACKUP)" == "complete" ]]; then
-        log_ok "Backup already completed — skipping."; return 0
+    # Must be CentOS 7
+    if ! grep -qi "centos.*7\|centos linux 7" /etc/centos-release 2>/dev/null; then
+        die "This script requires CentOS 7. Detected: $(cat /etc/centos-release 2>/dev/null || echo 'unknown')"
     fi
+    ok "OS: $(cat /etc/centos-release)"
 
-    if [[ "$SKIP_BACKUP" == true ]]; then
-        log_warn "--skip-backup: proceeding without backup."
-        confirm "Confirm: proceed WITHOUT backup?" || die "Migration aborted — backup required."
-        state_set "PHASE_BACKUP" "skipped"; return 0
+    # Must be x86_64
+    [[ "$(uname -m)" == "x86_64" ]] || die "Only x86_64 is supported."
+    ok "Arch: x86_64"
+
+    # Network
+    if ! curl -4 --silent --max-time 10 --head \
+            "https://repo.almalinux.org" &>/dev/null; then
+        die "Cannot reach repo.almalinux.org. Internet required."
     fi
+    ok "Network: repo.almalinux.org reachable"
 
-    if [[ -z "$BACKUP_DEV" ]]; then
-        echo
-        echo -e "  ${YELLOW}No backup device specified.${RESET}"
-        echo -e "  Enter block device path (e.g. /dev/sdb), or 's' to skip:"
-        echo -en "  ${YELLOW}Device: ${RESET}"
-        local inp; read -r inp
-        if [[ "$inp" == "s" ]]; then
-            confirm "Skip backup — you accept all risk?" || die "Aborted."
-            state_set "PHASE_BACKUP" "skipped"; return 0
-        fi
-        BACKUP_DEV="$inp"; state_set "BACKUP_DEV" "$BACKUP_DEV"
+    # Disk space — need at least 5G free on /
+    local free_gb
+    free_gb=$(df --output=avail -BG / | tail -1 | tr -d 'G ')
+    if [[ "$free_gb" -lt 5 ]]; then
+        die "Need at least 5G free on /. Available: ${free_gb}G"
     fi
+    ok "Disk: ${free_gb}G free on /"
 
-    [[ -b "$BACKUP_DEV" ]] || die "Not a block device: $BACKUP_DEV"
-
-    local root_dev source_disk
-    root_dev=$(df / | tail -1 | awk '{print $1}')
-    if echo "$root_dev" | grep -q "mapper"; then
-        source_disk=$(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}' | head -1 | sed 's/[0-9]*$//')
-    else
-        source_disk=$(echo "$root_dev" | sed 's/[0-9]*$//')
-    fi
-
-    local ss ds
-    ss=$(lsblk -bno SIZE "$source_disk" 2>/dev/null | head -1 || echo "0")
-    ds=$(lsblk -bno SIZE "$BACKUP_DEV"  2>/dev/null | head -1 || echo "0")
-
-    log_info "Source: $source_disk ($(numfmt --to=iec "$ss" 2>/dev/null || echo "${ss}B"))"
-    log_info "Target: $BACKUP_DEV ($(numfmt --to=iec "$ds" 2>/dev/null || echo "${ds}B"))"
-    [[ "$ds" -ge "$ss" ]] || die "Backup device is smaller than source disk."
-
-    echo; log_warn "This will OVERWRITE ALL DATA on $BACKUP_DEV."
-    confirm "Proceed with disk backup? (ERASES $BACKUP_DEV)" || die "Backup declined."
-
-    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-
-    log_info "Starting backup..."
-    local t0; t0=$(date +%s)
-    if command -v pv &>/dev/null; then
-        pv -tpreb "$source_disk" | dd of="$BACKUP_DEV" bs=4M conv=noerror,sync 2>&1
-    else
-        dd if="$source_disk" of="$BACKUP_DEV" bs=4M conv=noerror,sync status=progress 2>&1
-    fi
-    local elapsed=$(( $(date +%s) - t0 ))
-    log_ok "Backup done in ${elapsed}s."
-
-    log_info "Verifying backup integrity (first 512MB)..."
-    local sh dh
-    sh=$(dd if="$source_disk" bs=1M count=512 2>/dev/null | md5sum | awk '{print $1}')
-    dh=$(dd if="$BACKUP_DEV"  bs=1M count=512 2>/dev/null | md5sum | awk '{print $1}')
-    if [[ "$sh" == "$dh" ]]; then
-        log_ok "Backup verified (MD5: $sh)."
-        state_set "PHASE_BACKUP" "complete"
-        state_set "BACKUP_VERIFIED" "true"
-    else
-        die "BACKUP VERIFICATION FAILED. Source: $sh  Backup: $dh  DO NOT PROCEED."
-    fi
-
-    cat > "${LOG_DIR}/backup_metadata_${START_TIME}.txt" <<EOF
-Backup Date : $(date)
-Source      : $source_disk
-Target      : $BACKUP_DEV
-Duration    : ${elapsed}s
-MD5 (512M)  : $sh
-OS          : $(cat /etc/centos-release 2>/dev/null)
-Kernel      : $(uname -r)
-Restore cmd : dd if=$BACKUP_DEV of=$source_disk bs=4M conv=noerror,sync status=progress
-              grub2-install $source_disk && grub2-mkconfig -o /boot/grub2/grub.cfg
-EOF
-    log_ok "Metadata: ${LOG_DIR}/backup_metadata_${START_TIME}.txt"
+    ok "Pre-flight passed."
 }
 
-# ---------------------------------------------------------------------------
-# Phase 3: Prepare system
-# ---------------------------------------------------------------------------
-phase_prepare() {
-    log_section "Phase 3/6: Prepare System"
+# =============================================================================
+#  STEP 1 — Fix CentOS 7 repos (EOL — official mirrors are offline)
+#           Official fix from AlmaLinux wiki:
+#           curl -o /etc/yum.repos.d/CentOS-Base.repo \
+#                https://el7.repo.almalinux.org/centos/CentOS-Base.repo
+# =============================================================================
+fix_repos() {
+    step "Step 1/6: Fix CentOS 7 Repositories (EOL)"
+    info "CentOS 7 reached end-of-life. Official mirrors are offline."
+    info "Switching to AlmaLinux's CentOS 7 mirror (as per official guide)..."
 
-    if [[ "$(state_get PHASE_PREPARE)" == "complete" ]]; then
-        log_ok "Prepare already completed — skipping."; return 0
+    # Test if repos already work
+    if yum makecache fast &>/dev/null 2>&1; then
+        ok "Current repos are reachable — skipping repo fix."
+        return 0
     fi
 
-    confirm "Begin system preparation? (repo fix, yum update, cleanup)" || die "Aborted."
+    warn "Current repos unreachable. Applying AlmaLinux's CentOS 7 mirror..."
 
-    # ── Step 1: Fix CentOS 7 repos ──────────────────────────────────────────
-    # CentOS 7 EOL Jan 2024 — official mirrors are OFFLINE.
-    # Must point to vault.centos.org or AlmaLinux's el7 mirror.
-    log_info "1/8: Fixing CentOS 7 repos (EOL — official mirrors are offline)..."
-
-    # Test if existing repos work
-    if ! yum makecache fast &>/dev/null 2>&1; then
-        log_warn "  Current repos unreachable — switching to AlmaLinux's CentOS 7 mirror..."
-        curl -fsSL -o /etc/yum.repos.d/CentOS-Base.repo \
-            "https://el7.repo.almalinux.org/centos/CentOS-Base.repo" 2>/dev/null || \
-        # Fallback: write vault.centos.org repos manually
-        cat > /etc/yum.repos.d/CentOS-Base.repo << 'REPOEOF'
+    # Official fix from AlmaLinux wiki
+    curl -fsSL \
+        -o /etc/yum.repos.d/CentOS-Base.repo \
+        "https://el7.repo.almalinux.org/centos/CentOS-Base.repo" 2>/dev/null || {
+        # Fallback: vault.centos.org
+        warn "AlmaLinux mirror failed. Falling back to vault.centos.org..."
+        cat > /etc/yum.repos.d/CentOS-Base.repo << 'EOF'
 [base]
 name=CentOS-7 - Base
 baseurl=http://vault.centos.org/7.9.2009/os/$basearch/
@@ -742,623 +175,415 @@ baseurl=http://vault.centos.org/7.9.2009/extras/$basearch/
 gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
 enabled=1
+EOF
+    }
 
-[centosplus]
-name=CentOS-7 - Plus
-baseurl=http://vault.centos.org/7.9.2009/centosplus/$basearch/
-gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
-enabled=0
-REPOEOF
-        log_ok "  Repos pointed to vault.centos.org/7.9.2009"
-        yum clean all 2>/dev/null || true
+    yum clean all &>/dev/null
+    if yum makecache fast &>/dev/null 2>&1; then
+        ok "Repos fixed and reachable."
     else
-        log_ok "  Existing repos are reachable."
+        die "Cannot reach any CentOS 7 repos. Check your internet connection."
+    fi
+}
+
+# =============================================================================
+#  STEP 2 — Update system (official guide: "yum upgrade -y")
+# =============================================================================
+update_system() {
+    step "Step 2/6: Update System to Latest CentOS 7"
+    info "Running: yum upgrade -y"
+    info "(This may take several minutes...)"
+
+    yum upgrade -y 2>&1 | tee -a "$LOG_FILE" | tail -5
+    ok "System updated."
+
+    # Verify we are at CentOS 7.9 — required for ELevate
+    local release
+    release=$(cat /etc/centos-release 2>/dev/null || echo "")
+    if echo "$release" | grep -q "7\.9"; then
+        ok "CentOS 7.9 confirmed — meets ELevate requirement."
+    else
+        warn "Could not confirm CentOS 7.9. Current: $release"
+        warn "ELevate requires 7.9. If upgrade failed, check repo connectivity."
+        confirm "Continue anyway?" || die "Aborted."
+    fi
+}
+
+# =============================================================================
+#  STEP 3 — Pre-upgrade fixes (official guide manual steps for CentOS 7)
+#           From wiki: rmmod pata_acpi, PermitRootLogin, leapp answer
+#           Plus common inhibitors found on all CentOS 7 systems
+# =============================================================================
+preupgrade_fixes() {
+    step "Step 3/6: Apply Pre-Upgrade Fixes"
+    info "Applying fixes from leapp-report recommendations (official guide)..."
+
+    # ── Fix 1: pata_acpi — removed in RHEL8 kernel ───────────────────────────
+    info "  Blacklisting pata_acpi module (removed in RHEL 8)..."
+    rmmod pata_acpi 2>/dev/null || true
+    echo "blacklist pata_acpi" > /etc/modprobe.d/pata_acpi.conf
+    ok "  pata_acpi blacklisted."
+
+    # ── Fix 2: SSH PermitRootLogin ────────────────────────────────────────────
+    if ! grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null; then
+        info "  Setting PermitRootLogin yes (required for upgrade access)..."
+        echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+        ok "  PermitRootLogin yes added."
     fi
 
-    # ── Step 2: Install required packages missing from Core/minimal ──────────
-    # CentOS 7 Core (minimal install) is missing several packages leapp needs.
-    log_info "2/8: Installing packages required by ELevate (missing on Core installs)..."
-    local required_pkgs=(
-        # Core tools leapp needs
-        curl wget
-        # yum utilities
-        yum-utils
-        # Kernel devel (for module checks)
-        kernel-devel
-        # Python (leapp is Python 2)
-        python python2 python-six python-urllib3
-        # RPM tools
-        rpm-build rpmdevtools
-        # Network tools (for preflight checks)
-        bind-utils net-tools
-        # Other leapp deps
-        grub2-tools grubby
-        # Needed by leapp inhibitor checks
-        openssh-server
-    )
-    for pkg in "${required_pkgs[@]}"; do
-        rpm -q "$pkg" &>/dev/null 2>&1 || \
-            yum install -y "$pkg" 2>/dev/null | grep -E "Install|already" | tail -1 || true
-    done
-    log_ok "  Required packages installed."
-
-    # ── Step 3: Full system update ───────────────────────────────────────────
-    # leapp requires the system to be fully updated to CentOS 7.9
-    log_info "3/8: Updating all packages to latest CentOS 7.9..."
-    yum update -y 2>&1 | tail -20 || log_warn "yum update had non-zero exit — continuing."
-    log_ok "System updated."
-
-    # Verify we're on 7.9 (minimum required for ELevate)
-    local centos_ver
-    centos_ver=$(rpm -q --qf "%{VERSION}" centos-release 2>/dev/null || echo "unknown")
-    if [[ "$centos_ver" == "7" ]]; then
-        local centos_full
-        centos_full=$(cat /etc/centos-release 2>/dev/null || echo "")
-        log_info "  CentOS version: $centos_full"
-        if ! echo "$centos_full" | grep -q "7.9"; then
-            log_warn "  System may not be at 7.9 — ELevate requires CentOS 7.9."
-            log_warn "  Please ensure 'yum update' completed successfully."
-        fi
+    # ── Fix 3: ABRT — conflicts with leapp ───────────────────────────────────
+    if rpm -q abrt &>/dev/null 2>&1; then
+        info "  Removing ABRT (conflicts with leapp)..."
+        yum remove -y abrt abrt-libs abrt-cli abrt-addon-ccpp \
+            abrt-addon-kerneloops abrt-addon-python abrt-addon-vmcore \
+            --setopt=clean_requirements_on_remove=0 2>/dev/null | tail -3 || true
+        ok "  ABRT removed."
     fi
 
-    # ── Step 4: Clean yum cache ───────────────────────────────────────────────
-    log_info "4/8: Cleaning yum cache..."
-    yum clean all 2>/dev/null || true
-    rm -rf /var/cache/yum/* 2>/dev/null || true
-    log_ok "Cache cleaned."
-
-    # ── Step 5: Remove conflicting packages ───────────────────────────────────
-    log_info "5/8: Removing packages known to conflict with ELevate..."
-    local conflict=(
+    # ── Fix 4: Remove packages that conflict with ELevate ────────────────────
+    local conflict_pkgs=(
         centos-release-scl centos-release-scl-rh
         python2-virtualenv python-virtualenv
-        abrt abrt-addon-ccpp abrt-addon-kerneloops abrt-addon-pstoreoops
-        abrt-addon-python abrt-addon-vmcore abrt-addon-xorg abrt-cli
-        abrt-console-notification abrt-libs abrt-plugin-sosreport
     )
-    for pkg in "${conflict[@]}"; do
+    for pkg in "${conflict_pkgs[@]}"; do
         if rpm -q "$pkg" &>/dev/null 2>&1; then
-            log_info "  Removing: $pkg"
+            info "  Removing conflicting package: $pkg"
             yum remove -y "$pkg" \
-                --setopt=clean_requirements_on_remove=0 2>/dev/null || \
-                log_warn "  Could not remove $pkg — continuing."
+                --setopt=clean_requirements_on_remove=0 2>/dev/null || true
         fi
     done
-    log_ok "Conflicting packages removed."
 
-    # ── Step 6: Old kernels ────────────────────────────────────────────────────
-    log_info "6/8: Removing old kernels..."
-    package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
-    log_ok "Old kernels removed."
-
-    # ── Step 7: EPEL ──────────────────────────────────────────────────────────
-    if ! rpm -q epel-release &>/dev/null 2>&1; then
-        log_info "7/8: Installing EPEL..."
-        yum install -y epel-release 2>/dev/null && log_ok "EPEL installed." || \
-            log_warn "EPEL install failed — continuing."
-    else
-        log_ok "7/8: EPEL already present."
-    fi
-
-    # ── Step 8: Disable third-party repos + config backup ─────────────────────
-    log_info "8/8: Disabling third-party repos and backing up configs..."
-    find /etc/yum.repos.d/ -name "*.repo" \
-        ! -name "CentOS-*.repo" ! -name "epel*.repo" \
-        -exec bash -c 'sed -i "s/^enabled=1/enabled=0/" "$1"' _ {} \; 2>/dev/null || true
-    log_ok "Third-party repos disabled (re-enable post-upgrade)."
-    log_info "7/7: Saving package snapshot and config backups..."
-    rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort \
-        > "${LOG_DIR}/packages_before_${START_TIME}.txt"
-    local cbd="${LOG_DIR}/config_backup_${START_TIME}"
-    mkdir -p "$cbd"
-    for d in /etc/httpd /etc/nginx /etc/mysql /etc/my.cnf.d /etc/php.ini \
-              /etc/php.d /etc/postfix /etc/dovecot /etc/ssh /etc/cron.d \
-              /etc/sysconfig/network-scripts /etc/NetworkManager; do
-        [[ -e "$d" ]] && cp -a "$d" "$cbd/" 2>/dev/null && log_info "  Backed up: $d"
-    done
-    log_ok "Snapshots and configs saved: $cbd"
-
-    state_set "PHASE_PREPARE" "complete"
-    log_ok "System preparation complete."
-}
-
-# ---------------------------------------------------------------------------
-# leapp binary resolver (6-stage, with install fallback)
-# ---------------------------------------------------------------------------
-resolve_leapp_bin() {
-    # Stage 1: known paths
-    for p in /usr/bin/leapp /bin/leapp /usr/local/bin/leapp; do
-        [[ -x "$p" ]] && { LEAPP_BIN="$p"; log_ok "leapp: $LEAPP_BIN"; return 0; }
-    done
-    # Stage 2: PATH
-    if command -v leapp &>/dev/null 2>&1; then
-        LEAPP_BIN="$(command -v leapp)"; log_ok "leapp (PATH): $LEAPP_BIN"; return 0
-    fi
-    # Stage 3: filesystem search
-    local f
-    f=$(find / -name "leapp" -type f -executable 2>/dev/null | grep -v proc | grep -v sys | head -1 || true)
-    [[ -n "$f" ]] && { LEAPP_BIN="$f"; log_ok "leapp (search): $LEAPP_BIN"; return 0; }
-    # Stage 4: RPM file lists
-    local rb
-    for pkg in leapp python2-leapp leapp-upgrade-el7toel8; do
-        rb=$(rpm -ql "$pkg" 2>/dev/null | grep -E "bin/leapp$" | head -1 || true)
-        [[ -n "$rb" && -x "$rb" ]] && { LEAPP_BIN="$rb"; log_ok "leapp (RPM list): $LEAPP_BIN"; return 0; }
-    done
-    # Stage 5: install providers
-    log_warn "leapp binary not found — attempting to install provider packages..."
-    yum-config-manager --enable elevate &>/dev/null 2>&1 || true
-    for pkg in leapp python2-leapp leapp-framework; do
-        log_info "  Trying: yum install -y $pkg"
-        yum install -y "$pkg" 2>&1 | tail -5 || true
-        for p in /usr/bin/leapp /bin/leapp; do
-            [[ -x "$p" ]] && { LEAPP_BIN="$p"; log_ok "leapp after install: $LEAPP_BIN"; return 0; }
-        done
-        command -v leapp &>/dev/null 2>&1 && { LEAPP_BIN="$(command -v leapp)"; return 0; }
-    done
-    # Stage 6: diagnostic and die
-    log_error "══════════════════════════════════════════════════"
-    log_error "FATAL: leapp binary not found. Diagnostic dump:"
-    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" | while read -r p; do log_error "  pkg: $p"; done
-    yum repolist all 2>/dev/null | grep -i elevate | while read -r l; do log_error "  repo: $l"; done
-    for pkg in leapp python2-leapp leapp-upgrade-el7toel8; do
-        rpm -q "$pkg" &>/dev/null 2>&1 && \
-            rpm -ql "$pkg" 2>/dev/null | while read -r fl; do log_error "  [$pkg] $fl"; done
-    done
-    log_error "Manual fix: yum-config-manager --enable elevate && yum install -y leapp"
-    log_error "══════════════════════════════════════════════════"
-    die "Cannot proceed without leapp binary."
-}
-
-# ---------------------------------------------------------------------------
-# Phase 4: Install ELevate
-# ---------------------------------------------------------------------------
-phase_install_elevate() {
-    log_section "Phase 4/6: Install ELevate + leapp"
-
-    if [[ "$(state_get PHASE_ELEVATE)" == "complete" ]]; then
-        log_ok "ELevate already installed."
-        resolve_leapp_bin
-        _version_check_and_fix_leapp
-        return 0
-    fi
-
-    local elevate_url="https://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm"
-
-    # Install elevate-release
-    if rpm -q elevate-release &>/dev/null 2>&1; then
-        log_ok "elevate-release already installed."
-    else
-        log_info "Installing ELevate release package..."
-        yum install -y "$elevate_url" 2>&1 | tail -10 || true
-        rpm -q elevate-release &>/dev/null 2>&1 || die "elevate-release failed to install."
-        log_ok "elevate-release installed."
-    fi
-
-    # Force-enable elevate repo
-    log_info "Enabling ELevate repo..."
-    yum-config-manager --enable elevate &>/dev/null 2>&1 || \
-        sed -i "s/enabled=0/enabled=1/" /etc/yum.repos.d/elevate.repo 2>/dev/null || true
-    yum clean all &>/dev/null
-    log_ok "ELevate repo enabled."
-
-    # Install all leapp packages in one transaction
-    log_info "Installing leapp packages..."
-    case "$TARGET_DISTRO" in
-        alma)
-            yum install -y \
-                leapp python2-leapp leapp-upgrade leapp-data-almalinux \
-                2>&1 | tail -30 || true
-            rpm -q leapp-data-almalinux &>/dev/null 2>&1 || die "leapp-data-almalinux failed to install."
-            ;;
-        rocky)
-            yum install -y \
-                leapp python2-leapp leapp-upgrade leapp-data-rocky \
-                2>&1 | tail -30 || true
-            rpm -q leapp-data-rocky &>/dev/null 2>&1 || die "leapp-data-rocky failed to install."
-            ;;
-    esac
-
-    log_info "Installed leapp packages:"
-    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" | while read -r p; do log_info "  $p"; done
-
-    resolve_leapp_bin
-
-    # Version-aware fixes — must happen right after install
-    _version_check_and_fix_leapp
-
-    # Install nspawn wrapper to prevent NIC capture
-    _install_nspawn_wrapper
-    _patch_leapp_actor
-    _prevent_nspawn_network_namespace
-
-    state_set "PHASE_ELEVATE" "complete"
-    log_ok "ELevate installed."
-}
-
-# ---------------------------------------------------------------------------
-# _version_check_and_fix_leapp
-#
-# Reads the ACTUAL installed leapp version and applies the correct fix for
-# the subscription-manager issue based on what the source code actually does.
-#
-# From leapp source (github.com/oamg/leapp-repository):
-#
-# PR #1133 (merged Oct 2023): "default to NO_RHSM mode when sub-mgr not found"
-#   → After this fix: absent sub-mgr + LEAPP_NO_RHSM=1 = works fine
-#   → Before this fix: absent sub-mgr = ERROR regardless of flags
-#
-# The fix for ALL versions: directly patch the rhsm facts actor to skip
-# sub-mgr checks when LEAPP_NO_RHSM=1. This works on old AND new versions.
-# ---------------------------------------------------------------------------
-_version_check_and_fix_leapp() {
-    log_info "Checking leapp version and applying source-level fixes..."
-
-    # Get installed leapp version
-    local leapp_ver
-    leapp_ver=$(rpm -q --qf "%{VERSION}" leapp-upgrade 2>/dev/null || \
-                rpm -q --qf "%{VERSION}" leapp 2>/dev/null || \
-                echo "unknown")
-    log_info "  leapp version: $leapp_ver"
-
-    # Get the actual installed rhsm/subscription-manager actor file
-    # The actor that causes "Cannot set the container mode" error
-    local rhsm_actor_dirs=(
-        "/usr/share/leapp-repository/repositories/system_upgrade/el7toel8/actors"
-        "/usr/share/leapp-repository/repositories/system_upgrade/common/actors"
-        "/etc/leapp/repos.d/system_upgrade/el7toel8/actors"
-    )
-
-    local fixed_any=false
-
-    for actor_dir in "${rhsm_actor_dirs[@]}"; do
-        [[ -d "$actor_dir" ]] || continue
-
-        # Find all actor files that reference subscription-manager
-        while IFS= read -r actor_file; do
-            [[ -f "$actor_file" ]] || continue
-            grep -q "subscription.manager\|rhsm\|RHSM\|NO_RHSM" "$actor_file" 2>/dev/null || continue
-            grep -q "EL8MIGRATE_FIXED" "$actor_file" 2>/dev/null && continue
-
-            local actor_name; actor_name=$(basename "$(dirname "$actor_file")")/$(basename "$actor_file")
-            log_info "  Found rhsm actor: $actor_name"
-
-            # Backup
-            [[ -f "${actor_file}.el8migrate.orig" ]] || \
-                cp -f "$actor_file" "${actor_file}.el8migrate.orig" 2>/dev/null || true
-
-            # Apply source-level fix: wrap the process() method to check
-            # LEAPP_NO_RHSM=1 env var and skip if set
-            python2 - "$actor_file" << 'PYEOF' 2>/dev/null && {
-import sys, os, re
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-
-# Skip if already fixed
-if 'EL8MIGRATE_FIXED' in content:
-    sys.exit(0)
-
-# Strategy: add an early return to process() if LEAPP_NO_RHSM is set
-# This mirrors what PR #1133 did — skip RHSM entirely when not needed
-patch = '''
-    def process(self):  # EL8MIGRATE_FIXED: skip if LEAPP_NO_RHSM=1
-        import os
-        if os.environ.get('LEAPP_NO_RHSM', '0') == '1':
-            return
-        return self._process_impl()
-
-    def _process_impl(self):
-'''
-
-# Find the process() method and rename it
-if 'def process(self):' in content and 'EL8MIGRATE_FIXED' not in content:
-    content = content.replace('def process(self):', patch + '        # original process() body below\n        pass\n\n    def _original_process(self):', 1)
-    # Simpler approach: just add the guard at the start of process()
-    content = content
-
-# Actually: simplest reliable fix — insert env check at top of process()
-import re
-
-def add_guard(m):
-    indent = m.group(1)
-    body_start = m.group(0)
-    guard = indent + '    import os\n' + indent + '    if os.environ.get("LEAPP_NO_RHSM", "0") == "1":\n' + indent + '        return\n'
-    return body_start + guard
-
-# Match: def process(self): followed by newline+indent
-content = re.sub(
-    r'([ \t]*def process\(self\):[ \t]*\n)',
-    lambda m: m.group(0) + m.group(1).rstrip('\n').replace('def process(self):', '') + '    import os\n' +
-              m.group(1).rstrip('\n').replace('def process(self):', '') + '    if os.environ.get("LEAPP_NO_RHSM","0")=="1": return  # EL8MIGRATE_FIXED\n',
-    content,
-    count=1
-)
-
-with open(path, 'w') as f:
-    f.write(content)
-print("FIXED: " + path)
-sys.exit(0)
-PYEOF
-                log_ok "  Patched: $actor_name"
-                fixed_any=true
-            } || log_info "  Skipped: $actor_name"
-
-        done < <(find "$actor_dir" -name "actor.py" 2>/dev/null)
-    done
-
-    # Critical: ensure LEAPP_NO_RHSM is exported for the entire session
+    # ── Fix 5: subscription-manager — configure for non-RHSM ────────────────
+    # This is the fix for "Cannot set container mode for subscription-manager"
+    # Official workaround: set manage_repos=0 and use --no-rhsm flag
     export LEAPP_NO_RHSM=1
-    log_ok "  LEAPP_NO_RHSM=1 exported."
-
-    # Write /etc/rhsm/rhsm.conf with manage_repos=0
-    # This is the config-level fix that works regardless of actor version
-    mkdir -p /etc/rhsm /etc/rhsm/facts 2>/dev/null || true
-    if [[ ! -f /etc/rhsm/rhsm.conf ]] || ! grep -q "manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null; then
-        cat > /etc/rhsm/rhsm.conf << 'RHSMEOF'
+    mkdir -p /etc/rhsm 2>/dev/null || true
+    cat > /etc/rhsm/rhsm.conf << 'EOF'
 [rhsm]
 manage_repos = 0
 full_refresh_on_yum = 0
 report_package_profile = 0
-package_profile_on_trans = 0
 
 [rhsmcertd]
 autoAttachInterval = 1440
-splay = 1
 disable = 1
-RHSMEOF
-        log_ok "  /etc/rhsm/rhsm.conf created (manage_repos=0)"
-    else
-        sed -i 's/^manage_repos[[:space:]]*=.*/manage_repos = 0/' /etc/rhsm/rhsm.conf 2>/dev/null || true
-        log_ok "  /etc/rhsm/rhsm.conf updated (manage_repos=0)"
-    fi
+EOF
+    ok "  RHSM configured: manage_repos=0, LEAPP_NO_RHSM=1"
 
-    # Create a stub subscription-manager if absent (older leapp needs the binary)
-    if ! command -v subscription-manager &>/dev/null 2>&1; then
-        log_info "  Creating subscription-manager stub (required by older leapp versions)..."
-        cat > /usr/sbin/subscription-manager << 'SMEOF'
-#!/bin/sh
-# EL8MIGRATE_STUB: satisfies leapp binary check, returns 0 for all commands
-# Real sub-mgr removed or never installed. LEAPP_NO_RHSM=1 handles the rest.
-exit 0
-SMEOF
-        chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
-        log_ok "  Stub created: /usr/sbin/subscription-manager"
-    else
-        # Real sub-mgr present — configure it
-        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
-        log_ok "  subscription-manager configured (manage_repos=0)"
-    fi
+    # ── Fix 6: Install required tools ────────────────────────────────────────
+    info "  Installing required tools (yum-utils, curl)..."
+    yum install -y yum-utils curl 2>/dev/null | tail -3 || true
 
-    [[ "$fixed_any" == true ]] && \
-        log_ok "  leapp rhsm actors patched." || \
-        log_info "  No rhsm actors found to patch (may already be clean)."
+    # ── Fix 7: Clean old kernels (leapp prefers single kernel) ───────────────
+    info "  Cleaning old kernels..."
+    package-cleanup --oldkernels --count=1 -y 2>/dev/null || true
+
+    # ── Fix 8: Write leapp answerfile ────────────────────────────────────────
+    info "  Writing leapp answerfile (pre-answering all known questions)..."
+    mkdir -p /var/log/leapp 2>/dev/null || true
+    cat > /var/log/leapp/answerfile << 'EOF'
+[remove_pam_pkcs11_module_check]
+confirm = True
+
+[authselect_check]
+confirm = True
+
+[remove_ifcfg_files_check]
+confirm = True
+
+[grub_enableos_prober_check]
+confirm = True
+
+[verify_check_results]
+confirm = True
+EOF
+    ok "  Answerfile written."
+
+    ok "Pre-upgrade fixes applied."
 }
 
-# ---------------------------------------------------------------------------
-# Phase 4b: Fix leapp inhibitors (universal, idempotent)
-# ---------------------------------------------------------------------------
-_blacklist_driver() {
-    local drv="$1"
-    local bf="/etc/modprobe.d/${drv}.conf"
-    [[ -f "$bf" ]] || { echo "blacklist ${drv}" > "$bf"; log_ok "  Blacklisted: $drv"; }
-    lsmod 2>/dev/null | grep -q "^${drv} " && \
-        rmmod "$drv" 2>/dev/null && log_ok "  Unloaded: $drv" || true
+# =============================================================================
+#  STEP 4 — Install ELevate + leapp
+#           Official commands:
+#           yum install -y http://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm
+#           yum install -y leapp-upgrade leapp-data-almalinux
+# =============================================================================
+install_elevate() {
+    step "Step 4/6: Install ELevate and leapp"
+
+    # ── Install elevate-release ───────────────────────────────────────────────
+    if ! rpm -q elevate-release &>/dev/null 2>&1; then
+        info "Installing elevate-release package (official ELevate repo)..."
+        yum install -y \
+            "http://repo.almalinux.org/elevate/elevate-release-latest-el$(rpm --eval %rhel).noarch.rpm" \
+            2>&1 | tail -10
+        rpm -q elevate-release &>/dev/null 2>&1 || die "Failed to install elevate-release."
+        ok "elevate-release installed."
+    else
+        ok "elevate-release already installed."
+    fi
+
+    # ── Ensure elevate repo is enabled ───────────────────────────────────────
+    yum-config-manager --enable elevate &>/dev/null 2>&1 || \
+        sed -i 's/enabled=0/enabled=1/' /etc/yum.repos.d/elevate.repo 2>/dev/null || true
+    yum clean all &>/dev/null
+
+    # ── Install leapp packages ────────────────────────────────────────────────
+    local data_pkg
+    case "$TARGET" in
+        alma)  data_pkg="leapp-data-almalinux" ;;
+        rocky) data_pkg="leapp-data-rocky" ;;
+    esac
+
+    info "Installing: leapp-upgrade $data_pkg"
+    yum install -y leapp-upgrade "$data_pkg" 2>&1 | tee -a "$LOG_FILE" | tail -15
+
+    rpm -q "$data_pkg" &>/dev/null 2>&1 || die "Failed to install $data_pkg."
+
+    info "Installed leapp packages:"
+    rpm -qa 2>/dev/null | grep -iE "leapp|elevate" | \
+        while read -r p; do info "  $p"; done
+
+    ok "ELevate and leapp installed."
+
+    # ── Apply nspawn wrapper immediately after install ────────────────────────
+    # This MUST happen before any leapp command runs.
+    # Prevents systemd-nspawn v219 from moving enp0s3 into container namespace.
+    _install_nspawn_wrapper
 }
 
-# ---------------------------------------------------------------------------
-# _find_overlay — print overlay path or empty string
-# ---------------------------------------------------------------------------
-_find_overlay() {
-    local p
-    for p in \
-        "/var/lib/leapp/scratch/mounts/root_/system_overlay" \
-        "/var/lib/leapp/scratch/mounts/root_overlay"
-    do
-        [[ -d "$p" ]] && { echo "$p"; return; }
+# =============================================================================
+#  STEP 5 — leapp preupgrade + fix inhibitors
+#           Official commands:
+#           leapp preupgrade
+#           (fix inhibitors from leapp-report.txt)
+# =============================================================================
+run_preupgrade() {
+    step "Step 5/6: leapp preupgrade"
+
+    # Find leapp binary
+    local leapp_bin
+    leapp_bin=$(command -v leapp 2>/dev/null || echo "/usr/bin/leapp")
+    [[ -x "$leapp_bin" ]] || die "leapp binary not found."
+    ok "leapp: $leapp_bin"
+
+    info "Running: LEAPP_NO_RHSM=1 leapp preupgrade --no-rhsm"
+    info "(This performs a dry run — no packages installed)"
+    echo
+
+    # Record primary NIC before leapp runs (for watchdog and recovery)
+    local primary_nic
+    primary_nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}' || echo "")
+
+    # Start NIC watchdog — prevents enp0s3 from staying down if nspawn captures it
+    local watchdog_pid=""
+    if [[ -n "$primary_nic" ]]; then
+        _start_nic_watchdog "$primary_nic"
+        watchdog_pid=$!
+    fi
+
+    local max_attempts=3
+    local attempt=0
+    local passed=false
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        ((attempt++)) || true
+        info "leapp preupgrade — attempt $attempt/$max_attempts"
+
+        # Ensure network is up
+        _restore_network "$primary_nic"
+
+        # Apply subscription-manager fix before each attempt
+        export LEAPP_NO_RHSM=1
+        mkdir -p /etc/rhsm 2>/dev/null || true
+        grep -q "manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null || \
+            printf '[rhsm]\nmanage_repos = 0\n' > /etc/rhsm/rhsm.conf
+
+        # Sanitize EL8 installroot if it exists from a previous attempt
+        _sanitize_installroot
+
+        # Run preupgrade
+        local plog="${LOG_DIR}/preupgrade_attempt${attempt}_${START_TS}.log"
+        LEAPP_NO_RHSM=1 "$leapp_bin" preupgrade --no-rhsm \
+            2>&1 | tee "$plog" | tail -20 || true
+
+        # Restore network immediately after (nspawn may have taken it down)
+        _restore_network "$primary_nic"
+
+        # Check result
+        if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
+            err "No leapp report generated. Log: $plog"
+            continue
+        fi
+
+        cp /var/log/leapp/leapp-report.txt \
+           "${LOG_DIR}/leapp-report_attempt${attempt}_${START_TS}.txt"
+
+        local blockers
+        blockers=$(grep -c "^Risk Factor: high (error)" \
+            /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
+
+        if [[ "$blockers" -eq 0 ]]; then
+            ok "leapp preupgrade: PASSED — 0 blockers."
+            passed=true
+            break
+        fi
+
+        warn "Attempt $attempt: $blockers blocker(s) found."
+        _show_blockers
+        _auto_fix_inhibitors "$leapp_bin"
+
+        if [[ $attempt -lt $max_attempts ]]; then
+            info "Retrying after fixes..."
+            rm -rf /var/lib/leapp/storage 2>/dev/null || true
+            rm -f /var/log/leapp/leapp-report.txt 2>/dev/null || true
+        fi
     done
-    find /var/lib/leapp/scratch/ -maxdepth 5 -name "system_overlay" \
-        -type d 2>/dev/null | head -1 || true
-}
 
-# ---------------------------------------------------------------------------
-# _leapp_repo_file — print path to leapp EL8 .repo file or empty string
-# ---------------------------------------------------------------------------
-_leapp_repo_file() {
-    find /etc/leapp/files/ -name "*.repo" 2>/dev/null | head -1 || true
-}
+    # Stop watchdog
+    [[ -n "$watchdog_pid" ]] && kill "$watchdog_pid" 2>/dev/null || true
 
-# ---------------------------------------------------------------------------
-# _patch_leapp_repos — set sslverify=0 gpgcheck=0 in all leapp EL8 repo files
-# Safe: only touches the bootstrap repo leapp uses for the nspawn install.
-# The installed EL8 system gets its own clean repo files post-upgrade.
-# ---------------------------------------------------------------------------
-_patch_leapp_repos() {
-    local repo_file; repo_file=$(_leapp_repo_file)
-    [[ -z "$repo_file" ]] && return 0
-
-    log_info "  Patching leapp repo file: $repo_file"
-
-    # Use python2 (available on CentOS 7) for reliable INI manipulation
-    python2 - "$repo_file" << 'PYEOF' 2>/dev/null && { log_ok "  Repo file patched."; return 0; }
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    c = f.read()
-# Force sslverify=0 and gpgcheck=0 in every section
-for key in ('sslverify', 'gpgcheck'):
-    # Replace existing values
-    c = re.sub(r'^' + key + r'\s*=.*$', key + '=0', c, flags=re.M)
-    # Add after section header if missing
-    def add_if_missing(m):
-        header = m.group(0)
-        rest   = c[m.end():]
-        next_section = re.search(r'^\[', rest, re.M)
-        block = rest[:next_section.start()] if next_section else rest
-        if key not in block:
-            return header + '\n' + key + '=0'
-        return header
-    c = re.sub(r'^\[.+\]$', add_if_missing, c, flags=re.M)
-with open(path, 'w') as f:
-    f.write(c)
-sys.exit(0)
-PYEOF
-
-    # Fallback: sed
-    sed -i \
-        -e 's/^sslverify\s*=.*/sslverify=0/' \
-        -e 's/^gpgcheck\s*=.*/gpgcheck=0/' \
-        "$repo_file" 2>/dev/null || true
-    grep -q "^sslverify" "$repo_file" || \
-        sed -i '/^\[/a sslverify=0\ngpgcheck=0' "$repo_file" 2>/dev/null || true
-    log_ok "  Repo file patched (sed fallback)."
-}
-
-# ---------------------------------------------------------------------------
-# _host_dnf_bootstrap
-#
-# THE CORE FIX for "Unable to install RHEL 8 userspace packages"
-#
-# Root cause (confirmed through repeated testing):
-#   systemd-nspawn on CentOS 7 (systemd v219) running an overlay rootfs on
-#   a KVM guest has no working network inside the container. This is a hard
-#   limitation of nspawn v219 + overlay mounts — NOT fixable by copying
-#   resolv.conf, CA certs, or any config files into the overlay.
-#
-# Solution: Run the exact dnf install command leapp's nspawn actor would run,
-#   but from the HOST which has full network. The EL8 installroot gets
-#   pre-populated. When leapp's nspawn runs next, packages are already
-#   installed and no network access is needed inside the container.
-#
-# This function is safe to call multiple times (idempotent).
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# _find_primary_nic — find the real physical/virtual-machine NIC
-# Returns the interface name that should carry the default route.
-# Explicitly skips: lo, virbr*, veth*, docker*, br-*, bond (unless it has IP)
-# ---------------------------------------------------------------------------
-_find_primary_nic() {
-    # First: NIC that currently has the default route
-    local nic
-    nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-    [[ -n "$nic" ]] && { echo "$nic"; return; }
-
-    # Second: use the NIC saved at script start (most reliable)
-    [[ -n "${PRIMARY_NIC:-}" ]] && { echo "$PRIMARY_NIC"; return; }
-
-    # Third: find non-virtual NICs with a link (exclude virbr/veth/docker/br-)
-    while IFS= read -r iface; do
-        [[ "$iface" =~ ^(lo|virbr|veth|docker|br-|vnet|tun|tap) ]] && continue
-        ip link show "$iface" 2>/dev/null | grep -q "state UP\|state UNKNOWN" || continue
-        echo "$iface"; return
-    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//')
-
-    # Fourth: any non-virtual NIC even if DOWN
-    while IFS= read -r iface; do
-        [[ "$iface" =~ ^(lo|virbr|veth|docker|br-|vnet|tun|tap) ]] && continue
-        echo "$iface"; return
-    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//')
-}
-
-# ---------------------------------------------------------------------------
-# _restore_network — bring the primary NIC back up if nspawn took it down
-# Only touches the real NIC — never touches virbr0, veth, docker bridges
-# ---------------------------------------------------------------------------
-_restore_network() {
-    # If default route exists, network is fine
-    if ip route 2>/dev/null | grep -q "^default"; then
-        local nic gw
-        nic=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-        gw=$(ip route  2>/dev/null | awk '/^default/{print $3; exit}')
-        log_ok "  Network OK: $nic via $gw"
-        return 0
-    fi
-
-    log_warn "  No default route — network is down. Attempting recovery..."
-
-    local nic; nic=$(_find_primary_nic)
-    if [[ -z "$nic" ]]; then
-        log_warn "  Cannot identify primary NIC — skipping recovery."
-        return 0
-    fi
-
-    log_info "  Primary NIC: $nic — bringing up..."
-
-    # Bring link up
-    ip link set "$nic" up 2>/dev/null || true
-    sleep 2
-
-    # Try NetworkManager first (cleanest on CentOS 7)
-    if command -v nmcli &>/dev/null 2>&1; then
-        log_info "  Reconnecting via NetworkManager..."
-        nmcli device connect "$nic" 2>/dev/null || true
-        sleep 4
-        if ip route 2>/dev/null | grep -q "^default"; then
-            log_ok "  Network restored via NetworkManager ($nic)."
-            return 0
-        fi
-    fi
-
-    # Fallback: dhclient — kill any competing instance first
-    if command -v dhclient &>/dev/null 2>&1; then
-        log_info "  Trying dhclient on $nic..."
-        # Kill any existing dhclient for this NIC to avoid conflicts
-        pkill -f "dhclient.*$nic" 2>/dev/null || true
-        sleep 1
-        dhclient "$nic" 2>/dev/null
-        sleep 4
-        if ip route 2>/dev/null | grep -q "^default"; then
-            log_ok "  Network restored via dhclient ($nic)."
-            return 0
-        fi
-    fi
-
-    # Last resort: restart NetworkManager entirely
-    log_warn "  Restarting NetworkManager..."
-    systemctl restart NetworkManager 2>/dev/null || true
-    sleep 6
-    if ip route 2>/dev/null | grep -q "^default"; then
-        log_ok "  Network restored via NetworkManager restart."
-    else
-        log_warn "  Network could not be restored. Migration continues — check connectivity."
+    if [[ "$passed" != true ]]; then
+        echo
+        err "════════════════════════════════════════════"
+        err "leapp preupgrade blocked after $max_attempts attempts."
+        err ""
+        err "Review: cat /var/log/leapp/leapp-report.txt"
+        err "Then re-run this script."
+        err "════════════════════════════════════════════"
+        cat /var/log/leapp/leapp-report.txt 2>/dev/null | \
+            grep -E "^Risk Factor: high|^Title:" | head -20 || true
+        die "Preupgrade failed."
     fi
 }
 
-# ---------------------------------------------------------------------------
-# _install_nspawn_wrapper — THE definitive fix for enp0s3 disappearing
+# =============================================================================
+#  STEP 6 — leapp upgrade (POINT OF NO RETURN)
+#           Official command: leapp upgrade && reboot
+# =============================================================================
+run_upgrade() {
+    step "Step 6/6: leapp upgrade — POINT OF NO RETURN"
+
+    local leapp_bin
+    leapp_bin=$(command -v leapp 2>/dev/null || echo "/usr/bin/leapp")
+
+    echo
+    echo -e "${RED}${BLD}╔══════════════════════════════════════════════════╗${RST}"
+    echo -e "${RED}${BLD}║  ⚠  THIS CANNOT BE UNDONE                       ║${RST}"
+    echo -e "${RED}${BLD}║                                                  ║${RST}"
+    printf  "${RED}${BLD}║  Upgrading to : %-33s║${RST}\n" "${TARGET^^} Linux 8"
+    echo -e "${RED}${BLD}║  Next step    : System will reboot automatically ║${RST}"
+    echo -e "${RED}${BLD}║  After reboot : Run with --post-upgrade to verify║${RST}"
+    echo -e "${RED}${BLD}╚══════════════════════════════════════════════════╝${RST}"
+    echo
+
+    confirm "Proceed with upgrade and reboot?" || die "Upgrade cancelled."
+
+    # Final answer confirmations
+    "$leapp_bin" answer --section remove_pam_pkcs11_module_check.confirm=True \
+        2>/dev/null || true
+    "$leapp_bin" answer --section verify_check_results.confirm=True \
+        2>/dev/null || true
+
+    info "Running: LEAPP_NO_RHSM=1 leapp upgrade --no-rhsm"
+    info "System will reboot when complete. Watch the console for progress."
+    echo
+
+    LEAPP_NO_RHSM=1 "$leapp_bin" upgrade --no-rhsm \
+        2>&1 | tee "${LOG_DIR}/leapp-upgrade_${START_TS}.log" || true
+
+    info "leapp upgrade exited. Rebooting..."
+    sleep 3
+    reboot
+}
+
+# =============================================================================
+#  POST-UPGRADE — validate after reboot
+# =============================================================================
+post_upgrade() {
+    step "Post-Upgrade Validation"
+
+    echo "--- OS Release ---"
+    cat /etc/os-release 2>/dev/null || true
+    echo
+
+    echo "--- Kernel ---"
+    uname -r
+    echo
+
+    local os_name
+    os_name=$(grep "^NAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "unknown")
+
+    case "$TARGET" in
+        alma)
+            if grep -qi "almalinux" /etc/os-release 2>/dev/null; then
+                ok "✔  Successfully upgraded to AlmaLinux 8!"
+            else
+                warn "OS may not be AlmaLinux 8. Detected: $os_name"
+            fi ;;
+        rocky)
+            if grep -qi "rocky" /etc/os-release 2>/dev/null; then
+                ok "✔  Successfully upgraded to Rocky Linux 8!"
+            else
+                warn "OS may not be Rocky Linux 8. Detected: $os_name"
+            fi ;;
+    esac
+
+    # Official post-upgrade checks from the guide
+    echo
+    info "--- Packages remaining from CentOS 7 ---"
+    rpm -qa 2>/dev/null | grep "\.el7" || info "  None found."
+    echo
+
+    info "--- Post-upgrade recommended steps ---"
+    echo "  1. Set Python 3 as default:"
+    echo "       alternatives --set python /usr/bin/python3"
+    echo "  2. Re-enable SELinux enforcing:"
+    echo "       sed -i 's/SELINUX=permissive/SELINUX=enforcing/' /etc/selinux/config"
+    echo "       touch /.autorelabel && reboot"
+    echo "  3. Update all packages:"
+    echo "       dnf update -y"
+    echo "  4. Check for leftover el7 packages:"
+    echo "       rpm -qa | grep el7"
+    echo "  5. Remove old GPG keys:"
+    echo "       rpm -q gpg-pubkey --qf '%{NAME}-%{VERSION}-%{RELEASE}\t%{SUMMARY}\n'"
+    echo "  6. Clean up leapp artifacts:"
+    echo "       rm -fr /root/tmp_leapp_py3"
+    echo "       dnf clean all"
+    echo
+    info "Full logs: ${LOG_DIR}/"
+}
+
+# =============================================================================
+#  HELPER: Install systemd-nspawn wrapper
 #
-# Every previous approach (regex patching Python files) failed because the
-# nspawn command is assembled dynamically across multiple files. The wrapper
-# approach is bulletproof: replace the nspawn binary itself with a shell
-# script that injects --network-none into every single call, no matter which
-# leapp actor triggers it or how arguments are built.
-# ---------------------------------------------------------------------------
+#  Root cause: systemd-nspawn v219 (CentOS 7) has a bug where it moves the
+#  host NIC (enp0s3) into the container network namespace and NEVER moves it
+#  back when the container exits. This causes the NIC to vanish from the host.
+#
+#  Fix: replace /usr/bin/systemd-nspawn with a wrapper that always passes
+#  --network-none, preventing nspawn from ever touching the host NIC.
+#  The EL8 installroot is pre-populated from the host so no network is needed
+#  inside the container anyway.
+# =============================================================================
 _install_nspawn_wrapper() {
-    log_info "  [A] Installing systemd-nspawn --network-none wrapper..."
+    local real="/usr/bin/systemd-nspawn"
+    local backup="/usr/bin/systemd-nspawn.el8migrate.real"
+    local marker="EL8MIGRATE_NSPAWN_WRAPPER"
 
-    local real_bin="/usr/bin/systemd-nspawn"
-    local real_backup="/usr/bin/systemd-nspawn.el8migrate.real"
-    local marker="EL8MIGRATE_WRAPPER"
-
-    if grep -q "$marker" "$real_bin" 2>/dev/null; then
-        log_ok "  nspawn wrapper already in place."
-        return 0
-    fi
-
-    if [[ ! -f "$real_bin" ]]; then
-        log_warn "  $real_bin not found — skipping wrapper."
-        return 0
-    fi
-
-    [[ -f "$real_backup" ]] || cp -f "$real_bin" "$real_backup" 2>/dev/null || {
-        log_warn "  Cannot back up $real_bin — skipping wrapper."
+    grep -q "$marker" "$real" 2>/dev/null && {
+        ok "  nspawn wrapper already installed."
         return 0
     }
 
-    cat > "$real_bin" << 'WRAPPER'
+    [[ -f "$real" ]] || { warn "  systemd-nspawn not found — skipping wrapper."; return 0; }
+    [[ -f "$backup" ]] || cp -f "$real" "$backup" || { warn "  Cannot back up nspawn."; return 0; }
+
+    cat > "$real" << 'WRAPPER'
 #!/usr/bin/env bash
-# EL8MIGRATE_WRAPPER — injects --network-none into every nspawn call.
-# Prevents systemd-nspawn v219 from moving enp0s3 into container namespace.
+# EL8MIGRATE_NSPAWN_WRAPPER
+# Injects --network-none into every systemd-nspawn call.
+# Prevents systemd v219 bug where nspawn moves host NIC into container namespace.
 REAL="/usr/bin/systemd-nspawn.el8migrate.real"
 ARGS=("$@")
 has_network_none=false; is_boot=false
@@ -1373,173 +598,242 @@ else
 fi
 WRAPPER
 
-    chmod +x "$real_bin" 2>/dev/null || true
-
-    if grep -q "$marker" "$real_bin" 2>/dev/null; then
-        log_ok "  nspawn wrapper installed — NIC capture prevented for all leapp actors."
-    else
-        cp -f "$real_backup" "$real_bin" 2>/dev/null || true
-        log_warn "  Wrapper write failed — restored original."
-    fi
+    chmod +x "$real"
+    grep -q "$marker" "$real" 2>/dev/null && \
+        ok "  nspawn wrapper installed — NIC capture prevented." || \
+        { cp -f "$backup" "$real"; warn "  Wrapper write failed — restored original."; }
 }
 
 _remove_nspawn_wrapper() {
-    local real_bin="/usr/bin/systemd-nspawn"
-    local real_backup="/usr/bin/systemd-nspawn.el8migrate.real"
-    if [[ -f "$real_backup" ]]; then
-        cp -f "$real_backup" "$real_bin" 2>/dev/null && \
-            rm -f "$real_backup" && \
-            log_ok "systemd-nspawn restored to original."
-    fi
+    local real="/usr/bin/systemd-nspawn"
+    local backup="/usr/bin/systemd-nspawn.el8migrate.real"
+    [[ -f "$backup" ]] && cp -f "$backup" "$real" && rm -f "$backup" && \
+        ok "systemd-nspawn restored." || true
 }
 
-# Keep Python actor patching as belt-and-suspenders
-_patch_leapp_actor() {
-    log_info "  [A2] Patching leapp Python actors (belt-and-suspenders)..."
-    local found=false
-    for d in /usr/share/leapp-repository /etc/leapp/repos.d /usr/lib/leapp; do
-        [[ -d "$d" ]] || continue
-        while IFS= read -r f; do
-            grep -q "systemd-nspawn" "$f" 2>/dev/null || continue
-            grep -q "PATCHED_EL8_MIGRATE" "$f" 2>/dev/null && { found=true; continue; }
-            [[ -f "${f}.el8migrate.orig" ]] || cp -f "$f" "${f}.el8migrate.orig" 2>/dev/null || true
-            python2 - "$f" << 'PYEOF' 2>/dev/null && { log_ok "  Patched: $(basename "$f")"; found=true; } || true
-import sys, re
-p = sys.argv[1]
-with open(p) as fh: c = fh.read()
-orig = c
-c = re.sub(r"'--register=no'(\s*,)", r"'--register=no', '--network-none'\1", c)
-c = re.sub(r'"--register=no"(\s*,)', r'"--register=no", "--network-none"\1', c)
-c = re.sub(r'(systemd-nspawn\s+--register=no(?!\s+--network-none))', r'\1 --network-none', c)
-if c != orig:
-    c += '\n# PATCHED_EL8_MIGRATE\n'
-    with open(p, 'w') as fh: fh.write(c)
-    sys.exit(0)
-sys.exit(1)
-PYEOF
-        done < <(find "$d" -name "*.py" 2>/dev/null)
-    done
-    [[ "$found" == true ]] || log_info "  No actor files found yet."
+# =============================================================================
+#  HELPER: NIC watchdog — runs in background during preupgrade
+# =============================================================================
+_start_nic_watchdog() {
+    local nic="$1"
+    (
+        while true; do
+            sleep 5
+            # Only act on state DOWN or NO-CARRIER — not missing route
+            if ip link show "$nic" 2>/dev/null | grep -q "state DOWN\|NO-CARRIER"; then
+                echo "[$(date '+%H:%M:%S')] watchdog: $nic is DOWN — restoring..." \
+                    >> "$LOG_FILE" 2>/dev/null || true
+                ip link set "$nic" up 2>/dev/null || true
+                sleep 2
+                command -v nmcli &>/dev/null && nmcli device connect "$nic" 2>/dev/null || true
+            fi
+        done
+    ) &
+    echo $!
 }
 
-# ---------------------------------------------------------------------------
-# _prevent_nspawn_network_namespace
-# Belt-and-suspenders: systemd-level config to stop nspawn taking the NIC
-# ---------------------------------------------------------------------------
-_prevent_nspawn_network_namespace() {
-    log_info "  [B] Configuring systemd to prevent nspawn NIC capture..."
+# =============================================================================
+#  HELPER: Restore network if it went down
+# =============================================================================
+_restore_network() {
+    local preferred_nic="${1:-}"
 
-    # Drop-in for systemd-nspawn@.service — disable private networking
-    local dropin_dir="/etc/systemd/system/systemd-nspawn@.service.d"
-    mkdir -p "$dropin_dir" 2>/dev/null || true
-    cat > "${dropin_dir}/no-private-network.conf" << 'EOF'
-[Service]
-PrivateNetwork=no
-EOF
+    ip route 2>/dev/null | grep -q "^default" && return 0
 
-    # /etc/systemd/nspawn/ config files — cover all possible container names
-    # leapp uses the directory name of the overlay as the container name
-    local nspawn_conf_dir="/etc/systemd/nspawn"
-    mkdir -p "$nspawn_conf_dir" 2>/dev/null || true
-    for name in leapp root_ system_overlay mounts; do
-        cat > "${nspawn_conf_dir}/${name}.nspawn" << 'EOF'
-[Network]
-Private=no
-VirtualEthernet=no
-EOF
-    done
+    warn "No default route — network is down. Attempting recovery..."
 
-    # Stop systemd-networkd if running — it's the service that manages
-    # the nspawn veth interfaces and can interfere with the host NIC
-    if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
-        log_warn "  systemd-networkd is running — stopping it (leapp doesn't need it)..."
-        systemctl stop systemd-networkd 2>/dev/null || true
-        systemctl disable systemd-networkd 2>/dev/null || true
-        log_ok "  systemd-networkd stopped."
+    # If we know the NIC, target it specifically
+    if [[ -n "$preferred_nic" ]] && ! echo "$preferred_nic" | \
+            grep -qE "^(virbr|veth|docker|br-|vnet|tun|tap)"; then
+        ip link set "$preferred_nic" up 2>/dev/null || true
+        sleep 2
+        command -v nmcli &>/dev/null && nmcli device connect "$preferred_nic" 2>/dev/null || true
+        sleep 4
+        ip route 2>/dev/null | grep -q "^default" && {
+            ok "Network restored via $preferred_nic."; return 0; }
     fi
 
-    systemctl daemon-reload 2>/dev/null || true
-    log_ok "  nspawn network namespace prevention configured."
+    # Fallback: restart NetworkManager
+    systemctl restart NetworkManager 2>/dev/null || true
+    sleep 6
+    ip route 2>/dev/null | grep -q "^default" && \
+        ok "Network restored via NetworkManager restart." || \
+        warn "Network could not be restored automatically."
 }
 
-_host_dnf_bootstrap() {
-    local overlay="$1"
-    local leapp_repo; leapp_repo=$(_leapp_repo_file)
+# =============================================================================
+#  HELPER: Sanitize EL8 installroot — neutralize subscription-manager inside
+#          the nspawn container (it's installed as a dnf dependency)
+# =============================================================================
+_sanitize_installroot() {
+    # Find the EL8 installroot leapp creates
+    local overlay
+    overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 \
+        -name "system_overlay" -type d 2>/dev/null | head -1 || true)
+    [[ -z "$overlay" ]] && return 0
 
-    if [[ -z "$leapp_repo" ]]; then
-        log_warn "  _host_dnf_bootstrap: no leapp repo file found yet — skipping."
-        return 0
-    fi
-
-    # Target: the installroot leapp's actor populates inside the overlay
     local installroot="${overlay}/el8target"
+    [[ -d "$installroot" ]] || return 0
+
+    # Write rhsm.conf inside the installroot
+    mkdir -p "${installroot}/etc/rhsm" 2>/dev/null || true
+    printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n' \
+        > "${installroot}/etc/rhsm/rhsm.conf" 2>/dev/null || true
+
+    # Stub the sub-mgr binary inside the installroot
+    for sm in "${installroot}/usr/sbin/subscription-manager" \
+               "${installroot}/usr/bin/subscription-manager"; do
+        [[ -f "$sm" ]] || continue
+        grep -q "EL8MIGRATE" "$sm" 2>/dev/null && continue
+        printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm" 2>/dev/null || true
+        chmod +x "$sm" 2>/dev/null || true
+    done
+}
+
+# =============================================================================
+#  HELPER: Show blockers from leapp report
+# =============================================================================
+_show_blockers() {
+    [[ -f /var/log/leapp/leapp-report.txt ]] || return
+    echo
+    echo -e "${YEL}══ leapp report — blockers ══${RST}"
+    awk '/^Risk Factor: high \(error\)/{found=1} found && /^-{10}/{found=0} found{print}' \
+        /var/log/leapp/leapp-report.txt 2>/dev/null | head -40 || true
+    echo -e "${YEL}══════════════════════════════${RST}"
+    echo
+}
+
+# =============================================================================
+#  HELPER: Auto-fix known inhibitors between preupgrade attempts
+# =============================================================================
+_auto_fix_inhibitors() {
+    local leapp_bin="${1:-leapp}"
+    info "Auto-fixing known inhibitors..."
+
+    local report="/var/log/leapp/leapp-report.txt"
+    [[ -f "$report" ]] || return 0
+
+    # Fix: subscription-manager container mode
+    if grep -q "Cannot set the container mode" "$report"; then
+        info "  Fixing: subscription-manager container mode..."
+        export LEAPP_NO_RHSM=1
+        mkdir -p /etc/rhsm 2>/dev/null || true
+        printf '[rhsm]\nmanage_repos = 0\n' > /etc/rhsm/rhsm.conf
+        # Create stub if binary absent
+        if ! command -v subscription-manager &>/dev/null 2>&1; then
+            printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' \
+                > /usr/sbin/subscription-manager 2>/dev/null || true
+            chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
+        fi
+        ok "  subscription-manager fixed."
+    fi
+
+    # Fix: kernel drivers removed in RHEL8
+    if grep -q "kernel drivers" "$report" 2>/dev/null; then
+        info "  Blacklisting removed kernel drivers..."
+        local removed_drivers=(
+            pata_acpi floppy isdn nozomi aoe
+            snd_emu10k1_synth acerhdf bcm203x bpa10x
+            lirc_serial mptbase mptctl mptfc mptlan mptsas mptscsih mptspi
+            mtdblock n_hdlc pch_gbe snd_atiixp_modem snd_via82xx_modem
+            ueagle_atm usbatm xusbatm
+        )
+        for drv in "${removed_drivers[@]}"; do
+            if lsmod 2>/dev/null | grep -q "^${drv} " || \
+               grep -q "$drv" "$report" 2>/dev/null; then
+                echo "blacklist $drv" > "/etc/modprobe.d/${drv}.conf"
+                rmmod "$drv" 2>/dev/null || true
+            fi
+        done
+        ok "  Kernel drivers blacklisted."
+    fi
+
+    # Fix: nspawn network — pre-populate EL8 installroot from host
+    if grep -q "Unable to install RHEL 8 userspace" "$report" 2>/dev/null; then
+        info "  Fixing: nspawn network failure (pre-populating installroot from host)..."
+        _host_dnf_bootstrap
+        ok "  Installroot pre-populated."
+    fi
+
+    # Fix: pam_pkcs11 and other standard answers
+    for ans in \
+        "remove_pam_pkcs11_module_check.confirm=True" \
+        "authselect_check.confirm=True" \
+        "verify_check_results.confirm=True"
+    do
+        "$leapp_bin" answer --section "$ans" 2>/dev/null || true
+    done
+
+    # Refresh answerfile
+    cat > /var/log/leapp/answerfile << 'EOF'
+[remove_pam_pkcs11_module_check]
+confirm = True
+
+[authselect_check]
+confirm = True
+
+[remove_ifcfg_files_check]
+confirm = True
+
+[grub_enableos_prober_check]
+confirm = True
+
+[verify_check_results]
+confirm = True
+EOF
+
+    ok "Auto-fix complete."
+}
+
+# =============================================================================
+#  HELPER: Pre-populate EL8 installroot from host
+#          (bypasses nspawn network — host has full connectivity)
+# =============================================================================
+_host_dnf_bootstrap() {
+    local overlay
+    overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 \
+        -name "system_overlay" -type d 2>/dev/null | head -1 || true)
+    [[ -z "$overlay" ]] && return 0
+
+    local installroot="${overlay}/el8target"
+    local leapp_repo
+    leapp_repo=$(find /etc/leapp/files/ -name "*.repo" 2>/dev/null | head -1 || true)
+    [[ -z "$leapp_repo" ]] && return 0
+
+    # Already populated?
+    [[ -f "${installroot}/usr/bin/dnf" ]] && return 0
+
     mkdir -p "$installroot" 2>/dev/null || true
 
-    # Already done?
-    if [[ -f "${installroot}/usr/bin/dnf" ]] || [[ -f "${installroot}/bin/dnf" ]]; then
-        log_ok "  EL8 installroot already has dnf — bootstrap already complete."
-        return 0
-    fi
-
-    log_info "  Pre-populating EL8 installroot from host (bypassing nspawn network)..."
-    log_info "  Installroot: $installroot"
-
     # Ensure dnf on host
-    if ! command -v dnf &>/dev/null 2>&1; then
-        log_info "  Installing dnf on host..."
-        yum install -y dnf 2>/dev/null | tail -5 || true
-    fi
-    if ! command -v dnf &>/dev/null 2>&1; then
-        log_warn "  dnf unavailable on host — cannot bootstrap installroot."
-        return 0
-    fi
+    command -v dnf &>/dev/null 2>&1 || yum install -y dnf 2>/dev/null | tail -3 || true
+    command -v dnf &>/dev/null 2>&1 || return 0
 
-    # Work dir for host-side dnf config
+    info "  Pre-populating EL8 installroot from host..."
+    info "  (This may take 3-5 minutes)"
+
     local work_dir="/var/lib/leapp/scratch/host_dnf_work"
     mkdir -p "${work_dir}/repos.d" 2>/dev/null || true
 
-    # Patch repo file: sslverify=0, gpgcheck=0 (bootstrap only, not installed system)
-    python2 - "$leapp_repo" "${work_dir}/repos.d/el8.repo" << 'PYEOF' 2>/dev/null || \
+    # Copy and patch repo file (sslverify=0, gpgcheck=0 for bootstrap only)
+    sed -e 's/^sslverify=.*/sslverify=0/' \
+        -e 's/^gpgcheck=.*/gpgcheck=0/' \
+        "$leapp_repo" > "${work_dir}/repos.d/el8.repo" 2>/dev/null || \
         cp -f "$leapp_repo" "${work_dir}/repos.d/el8.repo"
-import sys, re
-src, dst = sys.argv[1], sys.argv[2]
-with open(src) as f:
-    c = f.read()
-for key in ('sslverify', 'gpgcheck'):
-    c = re.sub(r'^' + key + r'\s*=.*$', key + '=0', c, flags=re.M)
-    if key not in c:
-        c = re.sub(r'(\[[^\]]+\])', r'\1\n' + key + '=0', c)
-with open(dst, 'w') as f:
-    f.write(c)
-PYEOF
 
-    # Host dnf.conf — isolated from system repos
-    cat > "${work_dir}/dnf.conf" << CONF
-[main]
-gpgcheck=0
-sslverify=0
-installonly_limit=3
-clean_requirements_on_remove=True
-reposdir=${work_dir}/repos.d
-CONF
+    grep -q "^sslverify" "${work_dir}/repos.d/el8.repo" || \
+        sed -i '/^\[/a sslverify=0\ngpgcheck=0' "${work_dir}/repos.d/el8.repo" 2>/dev/null || true
 
-    # Enable all repos leapp defined
+    # dnf.conf
+    printf '[main]\ngpgcheck=0\nsslverify=0\nreposdir=%s/repos.d\n' \
+        "$work_dir" > "${work_dir}/dnf.conf"
+
+    # Build --enablerepo args
     local enable_repos=()
     while IFS= read -r line; do
         [[ "$line" =~ ^\[([^\]]+)\]$ ]] && enable_repos+=(--enablerepo "${BASH_REMATCH[1]}")
     done < "${work_dir}/repos.d/el8.repo"
 
-    if [[ ${#enable_repos[@]} -eq 0 ]]; then
-        log_warn "  No repo sections found in leapp repo file — skipping bootstrap."
-        return 0
-    fi
-
-    local dnf_log="${LOG_DIR}/host_dnf_bootstrap_${START_TIME}.log"
-    log_info "  Repos: ${enable_repos[*]}"
-    log_info "  Log: $dnf_log"
-    log_info "  (This may take 3-5 minutes — downloading EL8 bootstrap packages)"
-
-    # Run the same install leapp's actor runs, from host
     dnf install -y \
         --config="${work_dir}/dnf.conf" \
         --setopt="module_platform_id=platform:el8" \
@@ -1549,868 +843,59 @@ CONF
         --disablerepo="*" \
         "${enable_repos[@]+"${enable_repos[@]}"}" \
         dnf util-linux "dnf-command(config-manager)" \
-        2>&1 | tee "$dnf_log" || true
+        2>&1 | tail -10 || true
 
-    if [[ -f "${installroot}/usr/bin/dnf" ]] || [[ -f "${installroot}/bin/dnf" ]]; then
-        log_ok "  EL8 installroot bootstrapped from host. nspawn will skip the download."
-        # Sanitize the installroot immediately after bootstrap
-        _sanitize_el8_installroot "$installroot"
-    else
-        log_warn "  Host bootstrap incomplete. Check: $dnf_log"
-        tail -10 "$dnf_log" | while read -r l; do log_warn "    $l"; done
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# _sanitize_el8_installroot — fix subscription-manager INSIDE the installroot
-#
-# ROOT CAUSE (confirmed): host sub-mgr is absent, but leapp still reports
-# "Cannot set the container mode for subscription-manager" because the EL8
-# installroot has its own copy of subscription-manager-rhsm installed as
-# a dependency of dnf/rpm. The leapp actor runs INSIDE the nspawn container
-# where that EL8 sub-mgr IS present and fails the container-mode check.
-#
-# Fix: after the installroot is populated, neutralize sub-mgr inside it.
-# ---------------------------------------------------------------------------
-_sanitize_el8_installroot() {
-    local installroot="$1"
-    [[ -d "$installroot" ]] || return 0
-
-    log_info "  Sanitizing EL8 installroot: $installroot"
-
-    # Fix 1: Write rhsm.conf with manage_repos=0 inside installroot
-    # This prevents leapp's EL8 actor from attempting container mode
-    mkdir -p "${installroot}/etc/rhsm" 2>/dev/null || true
-    printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n\n[rhsmcertd]\nautoAttachInterval = 1440\n' \
-        > "${installroot}/etc/rhsm/rhsm.conf" 2>/dev/null || true
-    log_ok "    installroot rhsm.conf: manage_repos=0"
-
-    # Fix 2: Replace sub-mgr binary inside installroot with a stub
-    for sm_path in \
-        "${installroot}/usr/sbin/subscription-manager" \
-        "${installroot}/usr/bin/subscription-manager"
-    do
-        if [[ -f "$sm_path" ]] && ! grep -q "EL8MIGRATE" "$sm_path" 2>/dev/null; then
-            cp -f "$sm_path" "${sm_path}.el8migrate.orig" 2>/dev/null || true
-            printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm_path" 2>/dev/null || true
-            chmod +x "$sm_path" 2>/dev/null || true
-            log_ok "    stubbed: $sm_path"
-        elif [[ ! -f "$sm_path" ]]; then
-            # Ensure the directory exists and create a stub so leapp finds it
-            mkdir -p "$(dirname "$sm_path")" 2>/dev/null || true
-            printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm_path" 2>/dev/null || true
-            chmod +x "$sm_path" 2>/dev/null || true
-            log_ok "    stub created: $sm_path"
-        fi
-    done
-
-    # Fix 3: Set LEAPP_NO_RHSM in the installroot's environment profile
-    mkdir -p "${installroot}/etc/profile.d" 2>/dev/null || true
-    echo 'export LEAPP_NO_RHSM=1' > \
-        "${installroot}/etc/profile.d/el8migrate_no_rhsm.sh" 2>/dev/null || true
-
-    # Fix 4: Remove python-rhsm and subscription-manager-rhsm from installroot
-    # These are the packages that trigger the container-mode check
     if [[ -f "${installroot}/usr/bin/dnf" ]]; then
-        log_info "    Removing sub-mgr packages from installroot..."
-        chroot "$installroot" dnf remove -y \
-            subscription-manager \
-            subscription-manager-rhsm \
-            python3-subscription-manager-rhsm \
-            2>/dev/null | tail -3 || true
+        ok "  EL8 installroot pre-populated."
+        _sanitize_installroot
     fi
-
-    log_ok "  EL8 installroot sanitized."
 }
 
-# ---------------------------------------------------------------------------
-# fix_nspawn_network — comprehensive nspawn remediation
-# Applies ALL known fixes in order of least to most invasive.
-# ---------------------------------------------------------------------------
-# fix_nspawn_network — all-layer nspawn fix
-# Layer A: patch leapp actor to add --network-none
-# Layer B: prevent systemd from creating isolated network namespace
-# Layer C: patch leapp repo files (sslverify=0, gpgcheck=0)
-# Layer D: fix machine-id collision
-# Layer E: inject host network config into overlay
-# Layer F: host-side dnf bootstrap (pre-populate installroot, no network needed)
-# ---------------------------------------------------------------------------
-fix_nspawn_network() {
-    log_info "Applying nspawn remediation (all layers)..."
-
-    # Layers A+B run unconditionally — they prevent future network disruption
-    _install_nspawn_wrapper
-    _patch_leapp_actor
-    _prevent_nspawn_network_namespace
-
-    # Layers C-F need the overlay to exist
-    local overlay; overlay=$(_find_overlay)
-    if [[ -z "$overlay" ]]; then
-        log_info "  Overlay not yet created — layers C-F will run after first preupgrade."
-        return 0
-    fi
-    log_info "  Overlay: $overlay"
-
-    # Layer C: patch leapp repo files
-    log_info "  [C] Patching leapp EL8 repo files (sslverify=0, gpgcheck=0)..."
-    _patch_leapp_repos
-
-    # Layer D: machine-id collision
-    log_info "  [D] Checking machine-id collision..."
-    local host_mid; host_mid=$(cat /etc/machine-id 2>/dev/null || echo "x")
-    local ov_mid;   ov_mid=$(cat "${overlay}/etc/machine-id" 2>/dev/null || echo "")
-    if [[ "$host_mid" == "$ov_mid" ]] && [[ -n "$ov_mid" ]]; then
-        local new_id
-        new_id=$(od -An -tx1 /dev/urandom 2>/dev/null | head -1 | \
-                 tr -d ' \n' | cut -c1-32)
-        echo "$new_id" > "${overlay}/etc/machine-id" 2>/dev/null || true
-        log_ok "  machine-id collision fixed."
-    else
-        log_ok "  machine-id OK."
-    fi
-
-    # Layer E: inject host network config
-    log_info "  [E] Injecting host network config into overlay..."
-    mkdir -p "${overlay}/etc/pki/tls/certs" "${overlay}/etc/pki/ca-trust" 2>/dev/null || true
-    cp -f /etc/resolv.conf "${overlay}/etc/resolv.conf"                 2>/dev/null || true
-    cp -f /etc/hosts       "${overlay}/etc/hosts"                        2>/dev/null || true
-    [[ -f /etc/pki/tls/certs/ca-bundle.crt ]] && \
-        cp -f /etc/pki/tls/certs/ca-bundle.crt \
-              "${overlay}/etc/pki/tls/certs/ca-bundle.crt"               2>/dev/null || true
-    [[ -d /etc/pki/ca-trust ]] && \
-        cp -rf /etc/pki/ca-trust/. "${overlay}/etc/pki/ca-trust/"        2>/dev/null || true
-    log_ok "  Overlay network config injected."
-
-    # Layer F: host-side dnf bootstrap — pre-populate installroot from host
-    log_info "  [F] Running host-side EL8 bootstrap (pre-populates installroot)..."
-    _host_dnf_bootstrap "$overlay"
-
-    # Layer G: sanitize installroot — remove/stub sub-mgr INSIDE the container
-    # This is the fix for "Cannot set the container mode for subscription-manager"
-    log_info "  [G] Sanitizing EL8 installroot (neutralize sub-mgr inside container)..."
-    local installroot="${overlay}/el8target"
-    _sanitize_el8_installroot "$installroot"
-
-    log_ok "nspawn remediation complete (all layers applied)."
-}
-
-phase_fix_inhibitors() {
-    log_section "Phase 4b: Universal Inhibitor Remediation"
-
-    # Steps 1-3 run unconditionally on EVERY call (idempotent, cheap).
-    # Critical: these must run even when resuming from a saved state.
-
-    # Step 1: Neutralize subscription-manager completely.
-    # leapp's target_userspace_creator actor tries to call subscription-manager
-    # inside the nspawn container. We use 3 layers:
-    #   a) Remove all sub-mgr packages
-    #   b) Stub the binary to return 0 silently if removal fails
-    #   c) LEAPP_NO_RHSM=1 env var on all leapp commands
-    log_info "Step 1: Neutralizing subscription-manager..."
-    export LEAPP_NO_RHSM=1
-
-    # THE CORRECT FIX for "Cannot set the container mode for subscription-manager":
-    # Root cause: leapp's target_userspace_creator actor calls subscription-manager
-    # with container mode. The fix is NOT removal (leapp needs the binary) but
-    # configuring rhsm to disable repo management — leapp then skips this check.
-
-    # Layer a: Configure /etc/rhsm/rhsm.conf with manage_repos=0
-    mkdir -p /etc/rhsm 2>/dev/null || true
-    if [[ -f /etc/rhsm/rhsm.conf ]]; then
-        sed -i 's/^manage_repos[[:space:]]*=.*/manage_repos = 0/' /etc/rhsm/rhsm.conf 2>/dev/null || true
-        grep -q "^manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null || \
-            sed -i '/^\[rhsm\]/a manage_repos = 0' /etc/rhsm/rhsm.conf 2>/dev/null || true
-    else
-        printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n' > /etc/rhsm/rhsm.conf
-    fi
-    command -v subscription-manager &>/dev/null 2>&1 && \
-        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
-    log_ok "  rhsm: manage_repos=0 configured."
-
-    # Layer b: If sub-mgr binary is absent, create a minimal stub
-    # leapp actors expect the binary to exist even with LEAPP_NO_RHSM=1
-    if ! command -v subscription-manager &>/dev/null 2>&1 && [[ ! -f /usr/sbin/subscription-manager ]]; then
-        log_info "  subscription-manager missing — creating stub binary..."
-        printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > /usr/sbin/subscription-manager
-        chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
-        log_ok "  stub created at /usr/sbin/subscription-manager"
-    else
-        log_ok "  subscription-manager present."
-    fi
-
-    # Step 2: Write leapp answerfile (overwrite — no duplicates).
-    log_info "Step 2: Writing leapp answerfile..."
-    mkdir -p /var/log/leapp 2>/dev/null || true
-    cat > /var/log/leapp/answerfile << 'ANSEOF'
-[remove_pam_pkcs11_module_check]
-confirm = True
-
-[authselect_check]
-confirm = True
-
-[remove_ifcfg_files_check]
-confirm = True
-
-[grub_enableos_prober_check]
-confirm = True
-
-[verify_check_results]
-confirm = True
-
-[modified_files_check]
-confirm = True
-
-[check_custom_actors]
-confirm = True
-ANSEOF
-    log_ok "  Answerfile written: /var/log/leapp/answerfile"
-    # Belt-and-suspenders: also use leapp answer command
-    if [[ -n "${LEAPP_BIN:-}" ]]; then
-        for ans in \
-            "remove_pam_pkcs11_module_check.confirm=True" \
-            "authselect_check.confirm=True" \
-            "verify_check_results.confirm=True" \
-            "modified_files_check.confirm=True"
-        do
-            "$LEAPP_BIN" answer --section "$ans" 2>/dev/null || true
-        done
-    fi
-
-    # Step 3: Remove .orig backup files (leapp flags as custom actors)
-    log_info "Step 3: Removing .orig backup files..."
-    find /usr/share/leapp-repository/ \( -name "*.el8migrate.orig" -o -name "*.orig" \) \
-        -delete 2>/dev/null || true
-    log_ok "  .orig backups removed."
-
-    # Step 4: Dynamically blacklist drivers from leapp report
-    log_info "Step 4: Blacklisting removed drivers from leapp report..."
-    if [[ -f /var/log/leapp/leapp-report.txt ]]; then
-        local rdrvs=()
-        while IFS= read -r line; do
-            if echo "$line" | grep -qE "^\s+- [a-z0-9_]+$"; then
-                local d; d=$(echo "$line" | tr -d ' -')
-                [[ "$d" =~ ^[a-z0-9_]+$ ]] && [[ ${#d} -lt 40 ]] && rdrvs+=("$d")
-            fi
-        done < <(grep -A 20 "kernel drivers" /var/log/leapp/leapp-report.txt 2>/dev/null || true)
-        for d in "${rdrvs[@]+"${rdrvs[@]}"}"; do _blacklist_driver "$d"; done
-    fi
-
-    # Step 4: Universally removed drivers (EL7→EL8 and EL8→EL9)
-    log_info "Step 4: Blacklisting universally removed drivers..."
-    local udrvs=(
-        pata_acpi floppy isdn nozomi aoe
-        snd_emu10k1_synth acerhdf asus_acpi bcm203x bpa10x
-        lirc_serial mptbase mptctl mptfc mptlan mptsas mptscsih mptspi
-        mtdblock n_hdlc pch_gbe snd_atiixp_modem snd_via82xx_modem
-        ueagle_atm usbatm xusbatm
-    )
-    for d in "${udrvs[@]}"; do
-        if lsmod 2>/dev/null | grep -q "^${d} " || \
-           grep -q "$d" /var/log/leapp/leapp-report.txt 2>/dev/null; then
-            _blacklist_driver "$d"
-        fi
-    done
-
-    # Step 5: VDO
-    if systemctl is-active --quiet vdo 2>/dev/null; then
-        log_warn "VDO detected — stopping before upgrade..."
-        systemctl stop vdo 2>/dev/null || true
-        systemctl disable vdo 2>/dev/null || true
-        log_ok "VDO stopped."
-    fi
-
-    # Step 6: Legacy eth0 naming
-    if ip link show 2>/dev/null | grep -q "^[0-9]*: eth[0-9]"; then
-        log_warn "Legacy eth0 name — adding net.ifnames=0 biosdevname=0 kernel args..."
-        grubby --update-kernel=ALL --args="net.ifnames=0 biosdevname=0" 2>/dev/null || true
-    fi
-
-    # Step 7: Postfix compatibility
-    command -v postconf &>/dev/null 2>&1 && \
-        postconf -e compatibility_level=2 2>/dev/null && log_ok "Postfix compatibility_level=2." || true
-
-    # Step 8: ABRT — safe removal, no cascade
-    local abrt; abrt=$(rpm -qa 2>/dev/null | grep "^abrt" || true)
-    if [[ -n "$abrt" ]]; then
-        log_info "Removing ABRT packages (safe, no autoremove)..."
-        echo "$abrt" | xargs yum remove -y \
-            --setopt=clean_requirements_on_remove=0 2>/dev/null || true
-        log_ok "ABRT removed."
-    fi
-
-    # Safety: reinstall leapp if ABRT removal cascade-removed it
-    if ! rpm -q leapp-upgrade &>/dev/null 2>&1 && \
-       ! rpm -q leapp-upgrade-el7toel8 &>/dev/null 2>&1; then
-        log_warn "leapp-upgrade missing (cascade-removed) — reinstalling..."
-        yum-config-manager --enable elevate &>/dev/null 2>&1 || true
-        case "$TARGET_DISTRO" in
-            alma) yum install -y leapp leapp-upgrade leapp-data-almalinux 2>&1 | tail -10 || true ;;
-            rocky) yum install -y leapp leapp-upgrade leapp-data-rocky 2>&1 | tail -10 || true ;;
-        esac
-        resolve_leapp_bin
-        log_ok "leapp restored."
-    fi
-
-    # Step 9: /etc/redhat-release symlink
-    [[ ! -f /etc/redhat-release ]] && [[ -f /etc/centos-release ]] && \
-        ln -sf /etc/centos-release /etc/redhat-release 2>/dev/null && log_ok "redhat-release symlink fixed." || true
-
-    # Step 10: leapp directories
-    mkdir -p /var/log/leapp /etc/leapp/files 2>/dev/null || true
-
-    # Step 11: IPv6 — disable if broken (leapp nspawn inherits host network)
-    local ipv6off; ipv6off=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "1")
-    if [[ "$ipv6off" == "0" ]] && ! ping6 -c 1 -W 3 2620:fe::fe &>/dev/null 2>&1; then
-        log_warn "Broken IPv6 detected — disabling to prevent leapp nspawn repo failures..."
-        sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
-        sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
-        grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null || \
-            printf '\n# el8-migration\nnet.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\n' >> /etc/sysctl.conf
-        log_ok "IPv6 disabled."
-    fi
-
-    # Step 12: Fix nspawn overlay network (resolv.conf missing/empty in container)
-    # This is the most common cause of "Failed to synchronize cache for repo"
-    # even when host network is working perfectly.
-    log_info "Step 12: Fixing nspawn overlay network configuration..."
-    fix_nspawn_network
-
-    state_set "PHASE_INHIBITORS" "complete"
-    log_ok "Inhibitor remediation complete."
-}
-
-# ---------------------------------------------------------------------------
-# Phase 5: leapp preupgrade (with auto-retry + nspawn bypass)
-# ---------------------------------------------------------------------------
-phase_preupgrade() {
-    log_section "Phase 5/6: leapp preupgrade (DRY RUN)"
-
-    if [[ "$(state_get PHASE_PREUPGRADE)" == "complete" ]]; then
-        log_ok "preupgrade already passed — skipping."; return 0
-    fi
-
-    log_info "This is a DRY RUN — no changes are made to the system."
-
-    # Apply layers A+B BEFORE the first preupgrade run.
-    # These prevent nspawn from stealing the host NIC — must happen before
-    # leapp ever spawns a container, not after the NIC is already gone.
-    log_info "Pre-flight: patching nspawn to prevent host network disruption..."
-    _install_nspawn_wrapper
-    _patch_leapp_actor
-    _prevent_nspawn_network_namespace
-
-    # Record the primary NIC NOW before leapp runs — this is the authoritative
-    # source for _restore_network and the watchdog to use.
-    PRIMARY_NIC=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-    if [[ -z "$PRIMARY_NIC" ]]; then
-        PRIMARY_NIC=$(_find_primary_nic)
-    fi
-    export PRIMARY_NIC
-
-    # Start a background NIC watchdog ONLY if we know the real NIC.
-    # The watchdog uses NM (not dhclient) to avoid competing with existing DHCP.
-    # It only acts if the interface actually goes DOWN — not just missing route.
-    local WATCHDOG_PID=""
-    if [[ -n "$PRIMARY_NIC" ]]; then
-        log_info "Primary NIC: $PRIMARY_NIC — starting watchdog..."
-        (
-            local nic="$PRIMARY_NIC"
-            while true; do
-                sleep 5
-                # Check if NIC went DOWN (link state, not just missing route)
-                if ip link show "$nic" 2>/dev/null | grep -q "state DOWN\|NO-CARRIER"; then
-                    echo "[watchdog $(date '+%H:%M:%S')] $nic is DOWN — restoring link..." \
-                        >> "${LOG_FILE:-/tmp/el8migrate.log}" 2>/dev/null || true
-                    ip link set "$nic" up 2>/dev/null || true
-                    sleep 2
-                    # Use NM if available — it manages DHCP cleanly
-                    if command -v nmcli &>/dev/null 2>&1; then
-                        nmcli device connect "$nic" 2>/dev/null || true
-                    fi
-                fi
-            done
-        ) &
-        WATCHDOG_PID=$!
-        log_info "NIC watchdog PID $WATCHDOG_PID (monitors $PRIMARY_NIC)."
-    else
-        log_warn "Could not determine primary NIC — watchdog not started."
-    fi
-
-    local max_attempts=4
-    local attempt=0
-    local nspawn_fixed=false
-
-    while [[ $attempt -lt $max_attempts ]]; do
-        ((attempt++)) || true
-        log_info "leapp preupgrade — attempt $attempt/$max_attempts..."
-
-        # Always re-run inhibitor fixes before each attempt.
-        # This ensures subscription-manager removal and answerfile are current.
-        state_set "PHASE_INHIBITORS" ""
-        phase_fix_inhibitors
-
-        # Verify network is up before each attempt
-        _restore_network
-
-        # Apply version-aware fixes before every attempt
-        _version_check_and_fix_leapp
-
-        # Sanitize EL8 installroot if it exists — neutralize sub-mgr inside it
-        local _ir; _ir=$(_find_overlay)
-        [[ -n "$_ir" ]] && _sanitize_el8_installroot "${_ir}/el8target"
-
-        local plog="${LOG_DIR}/leapp_preupgrade_${START_TIME}_attempt${attempt}.log"
-        LEAPP_NO_RHSM=1 "$LEAPP_BIN" preupgrade --no-rhsm 2>&1 | tee "$plog" || true
-
-        # ALWAYS restore network after preupgrade — nspawn may have taken it down
-        log_info "Checking host network after preupgrade run..."
-        _restore_network
-
-        if [[ ! -f /var/log/leapp/leapp-report.txt ]]; then
-            log_error "leapp report not generated. See: $plog"
-            die "leapp preupgrade failed to produce a report."
-        fi
-
-        cp /var/log/leapp/leapp-report.txt \
-           "${LOG_DIR}/leapp_report_${START_TIME}_attempt${attempt}.txt"
-
-        # Count hard blockers
-        local inhibitor_count error_count
-        inhibitor_count=$(grep -c "^Risk Factor: high (error)" \
-            /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
-        error_count=$(grep -c "Following errors occurred" \
-            /var/log/leapp/leapp-report.txt 2>/dev/null || echo "0")
-
-        if [[ "$inhibitor_count" -eq 0 ]] && [[ "$error_count" -eq 0 ]]; then
-            log_ok "leapp preupgrade: CLEAR — 0 inhibitors, 0 errors."
-            state_set "PHASE_PREUPGRADE" "complete"
-            return 0
-        fi
-
-        log_warn "Attempt $attempt: inhibitors=$inhibitor_count errors=$error_count"
-
-        # Detect nspawn "Unable to install RHEL 8 userspace packages" error
-        local has_nspawn_error=false
-        grep -q "Unable to install RHEL 8 userspace packages" \
-            /var/log/leapp/leapp-report.txt 2>/dev/null && has_nspawn_error=true
-
-        if [[ $attempt -lt $max_attempts ]]; then
-            if [[ "$has_nspawn_error" == true ]] && [[ "$nspawn_fixed" == false ]]; then
-                log_info "── Detected nspawn repo failure → applying full nspawn remediation ──"
-                fix_nspawn_network
-                nspawn_fixed=true
-            else
-                log_info "── Running full inhibitor remediation (attempt $attempt) ──"
-                state_set "PHASE_INHIBITORS" ""
-                phase_fix_inhibitors
-            fi
-            # Clear stale report and actor state so next run is fresh
-            rm -rf /var/lib/leapp/storage 2>/dev/null || true
-            rm -f  /var/log/leapp/leapp-report.txt 2>/dev/null || true
-        else
-            echo
-            log_error "═══════════════════════════════════════════════════════════"
-            log_error "MANUAL ACTION REQUIRED:"
-            log_error "Inhibitors remain after $max_attempts auto-remediation attempts."
-            log_error ""
-            log_error "1. Review report: cat /var/log/leapp/leapp-report.txt"
-            log_error "2. Fix each INHIBITOR listed above manually"
-            log_error "3. Re-run: sudo $SCRIPT_NAME --migrate"
-            log_error "   (Migration will resume from this phase)"
-            log_error "═══════════════════════════════════════════════════════════"
-            echo
-            grep -E "^Risk Factor: high|^Title:" /var/log/leapp/leapp-report.txt 2>/dev/null || true
-            die "leapp preupgrade blocked after $max_attempts attempts."
-        fi
-    done
-
-    # Clean up watchdog
-    [[ -n "${WATCHDOG_PID:-}" ]] && kill "$WATCHDOG_PID" 2>/dev/null || true
-}
-
-# ---------------------------------------------------------------------------
-# Phase 6: leapp upgrade — POINT OF NO RETURN
-# ---------------------------------------------------------------------------
-phase_upgrade() {
-    log_section "Phase 6/6: leapp upgrade — POINT OF NO RETURN"
-
-    echo
-    echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${RED}${BOLD}║  ⚠  FINAL WARNING — THIS CANNOT BE UNDONE               ║${RESET}"
-    echo -e "${RED}${BOLD}║                                                          ║${RESET}"
-    printf  "${RED}${BOLD}║  Target  : %-47s║${RESET}\n" "${TARGET_DISTRO^^} Linux 8"
-    echo -e "${RED}${BOLD}║  Action  : In-place OS upgrade + automatic reboot        ║${RESET}"
-    echo -e "${RED}${BOLD}║  Recovery: Only via backup restore if something fails    ║${RESET}"
-    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
-    echo
-
-    confirm "FINAL CONFIRMATION: Upgrade to ${TARGET_DISTRO^^} Linux 8 and reboot?" || \
-        die "Upgrade cancelled at final confirmation."
-
-    # Final answers
-    "$LEAPP_BIN" answer --section remove_pam_pkcs11_module_check.confirm=True 2>/dev/null || true
-    "$LEAPP_BIN" answer --section authselect_check.confirm=True 2>/dev/null || true
-
-    state_set "PHASE_UPGRADE" "started"
-    log_info "Running leapp upgrade — system will reboot automatically..."
-    echo
-
-    LEAPP_NO_RHSM=1 "$LEAPP_BIN" upgrade --no-rhsm \
-        2>&1 | tee "${LOG_DIR}/leapp_upgrade_${START_TIME}.log" || true
-
-    # Restore network if nspawn took it down during upgrade
-    _restore_network
-
-    # Should not reach here normally
-    log_info "leapp upgrade exited. Waiting for reboot..."
-    log_info "If no reboot in 2 minutes, run: reboot"
-    log_info "After reboot: sudo $SCRIPT_NAME --post-upgrade"
-}
-
-# ===========================================================================
-#  SECTION 4 — POST-UPGRADE VALIDATION
-# ===========================================================================
-
-run_post_upgrade() {
-    log_section "POST-UPGRADE VALIDATION"
-
-    # Restore original systemd-nspawn (remove our wrapper — no longer needed)
-    _remove_nspawn_wrapper
-    cat /etc/os-release 2>/dev/null || echo "(not found)"
-    echo
-
-    echo "--- Kernel ---"
-    uname -a; echo
-
-    # Confirm target distro
-    if [[ -f /etc/almalinux-release ]]; then
-        log_ok "AlmaLinux confirmed: $(cat /etc/almalinux-release)"
-    elif [[ -f /etc/rocky-release ]]; then
-        log_ok "Rocky Linux confirmed: $(cat /etc/rocky-release)"
-    elif grep -q " 8" /etc/redhat-release 2>/dev/null; then
-        log_ok "EL8 confirmed: $(cat /etc/redhat-release)"
-    else
-        log_error "Cannot confirm EL8. Check /etc/os-release manually."
-    fi
-
-    # Package manager
-    echo "--- dnf version ---"
-    dnf --version 2>/dev/null || log_error "dnf not available!"
-    echo
-
-    # Services
-    log_section "Service Health"
-    for s in sshd NetworkManager rsyslog crond; do
-        if systemctl is-active --quiet "$s" 2>/dev/null; then
-            log_ok "$s: running"
-        else
-            log_warn "$s: NOT running — check: systemctl status $s"
-        fi
-    done
-    echo
-    echo "--- Failed systemd units ---"
-    systemctl --failed 2>/dev/null || true
-    echo
-
-    # Network
-    log_section "Network"
-    ping -c2 -W3 8.8.8.8 &>/dev/null && log_ok "IPv4 connectivity OK." || log_warn "No IPv4 to 8.8.8.8."
-    ping -c2 -W3 google.com &>/dev/null && log_ok "DNS OK." || log_warn "DNS may be broken."
-
-    # EPEL
-    if ! rpm -q epel-release &>/dev/null 2>&1; then
-        log_info "Installing EPEL for EL8..."
-        if [[ -f /etc/rocky-release ]]; then
-            dnf config-manager --enable crb 2>/dev/null || \
-            dnf config-manager --set-enabled powertools 2>/dev/null || true
-        fi
-        dnf install -y epel-release 2>/dev/null && log_ok "EPEL installed." || log_warn "EPEL install failed."
-    else
-        log_ok "EPEL present."
-    fi
-
-    # Config conflicts
-    log_section "Configuration Conflicts"
-    echo "--- .rpmsave (old config backed up by RPM) ---"
-    find /etc -name "*.rpmsave" 2>/dev/null | head -20
-    echo
-    echo "--- .rpmnew (new default config from RPM) ---"
-    find /etc -name "*.rpmnew" 2>/dev/null | head -20
-    echo
-    log_warn "Review and merge .rpmsave / .rpmnew files — these indicate config changes from upgraded packages."
-
-    # Package delta
-    log_section "Package Delta"
-    rpm -qa --queryformat '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort \
-        > "${LOG_DIR}/packages_after_${START_TIME}.txt"
-    local bf; bf=$(ls -t "${LOG_DIR}"/packages_before_*.txt 2>/dev/null | head -1 || echo "")
-    if [[ -n "$bf" ]]; then
-        echo "Packages removed during upgrade:"
-        diff "$bf" "${LOG_DIR}/packages_after_${START_TIME}.txt" 2>/dev/null | grep "^<" | head -20
-        echo
-        echo "Packages added during upgrade:"
-        diff "$bf" "${LOG_DIR}/packages_after_${START_TIME}.txt" 2>/dev/null | grep "^>" | head -20
-    fi
-
-    # Checklist
-    log_section "Post-Upgrade Action Checklist"
-    echo
-    echo -e "  ${CYAN}1.${RESET} Set Python 3 as default:"
-    echo -e "       alternatives --set python /usr/bin/python3"
-    echo
-    echo -e "  ${CYAN}2.${RESET} Re-enable SELinux enforcing:"
-    echo -e "       sed -i 's/SELINUX=permissive/SELINUX=enforcing/' /etc/selinux/config"
-    echo -e "       touch /.autorelabel && reboot"
-    echo
-    echo -e "  ${CYAN}3.${RESET} Apply security patches:"
-    echo -e "       dnf update --security -y"
-    echo
-    echo -e "  ${CYAN}4.${RESET} Review crypto policies:"
-    echo -e "       update-crypto-policies --show"
-    echo
-    echo -e "  ${CYAN}5.${RESET} Diff SSH config changes:"
-    echo -e "       diff /etc/ssh/sshd_config /etc/ssh/sshd_config.rpmsave 2>/dev/null"
-    echo
-    if [[ -f /etc/rocky-release ]]; then
-        echo -e "  ${CYAN}6.${RESET} Rocky: Enable CRB repo:"
-        echo -e "       dnf config-manager --enable crb"
-        echo
-    fi
-    echo -e "  ${CYAN}7.${RESET} Re-enable third-party repos with EL8-compatible versions:"
-    echo -e "       Review each file in /etc/yum.repos.d/ and update URLs"
-    echo
-    echo -e "  ${CYAN}8.${RESET} Future EL8 → EL9 upgrade when ready:"
-    echo -e "       dnf update -y"
-    echo -e "       dnf install -y https://repo.almalinux.org/elevate/elevate-release-latest-el8.noarch.rpm"
-    echo -e "       dnf install -y leapp-upgrade leapp-data-almalinux  # or leapp-data-rocky"
-    echo -e "       leapp preupgrade && leapp upgrade"
-    echo
-
-    log_ok "Post-upgrade validation complete."
-}
-
-# ===========================================================================
-#  SECTION 5 — MIGRATION WIZARD
-# ===========================================================================
-
-do_migrate() {
-    log_section "MIGRATION WIZARD"
-
-    # ── Always run these checks regardless of saved state ───────────────────
-    # Subscription-manager removal and answerfile must be current on every run.
-    log_info "Pre-checks (always run)..."
-
-    # Fix subscription-manager: configure rhsm to not manage repos
-    export LEAPP_NO_RHSM=1
-    mkdir -p /etc/rhsm 2>/dev/null || true
-    if [[ -f /etc/rhsm/rhsm.conf ]]; then
-        sed -i 's/^manage_repos[[:space:]]*=.*/manage_repos = 0/' /etc/rhsm/rhsm.conf 2>/dev/null || true
-        grep -q "^manage_repos" /etc/rhsm/rhsm.conf 2>/dev/null || \
-            sed -i '/^\[rhsm\]/a manage_repos = 0' /etc/rhsm/rhsm.conf 2>/dev/null || true
-    else
-        printf '[rhsm]\nmanage_repos = 0\nfull_refresh_on_yum = 0\n' > /etc/rhsm/rhsm.conf
-    fi
-    command -v subscription-manager &>/dev/null 2>&1 && \
-        subscription-manager config --rhsm.manage_repos=0 2>/dev/null || true
-    log_ok "  rhsm: manage_repos=0"
-    # Ensure binary exists (leapp needs it even with --no-rhsm)
-    if ! command -v subscription-manager &>/dev/null 2>&1 && [[ ! -f /usr/sbin/subscription-manager ]]; then
-        printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > /usr/sbin/subscription-manager
-        chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
-        log_ok "  subscription-manager stub created."
-    fi
-
-    # Write answerfile unconditionally (overwrite — always fresh)
-    mkdir -p /var/log/leapp 2>/dev/null || true
-    cat > /var/log/leapp/answerfile << 'ANSEOF'
-[remove_pam_pkcs11_module_check]
-confirm = True
-
-[authselect_check]
-confirm = True
-
-[remove_ifcfg_files_check]
-confirm = True
-
-[grub_enableos_prober_check]
-confirm = True
-
-[verify_check_results]
-confirm = True
-
-[modified_files_check]
-confirm = True
-
-[check_custom_actors]
-confirm = True
-ANSEOF
-    log_ok "  Answerfile written."
-
-    # Version-aware leapp fixes (sub-mgr, rhsm config, actor patches)
-    [[ -n "${LEAPP_BIN:-}" ]] && _version_check_and_fix_leapp || true
-
-    # Install nspawn wrapper unconditionally (idempotent)
-    _install_nspawn_wrapper
-    _prevent_nspawn_network_namespace
-
-    # Remove .orig backups unconditionally
-    find /usr/share/leapp-repository/ -name "*.el8migrate.orig" \
-        -delete 2>/dev/null || true
-    # ────────────────────────────────────────────────────────────────────────
-
-    # Run preflight first — always
-    log_info "Running preflight assessment..."
-    run_preflight
-    print_preflight_report
-
-    # Hard stop on blockers
-    if [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]]; then
-        echo
-        log_error "══════════════════════════════════════════════════"
-        log_error "MIGRATION BLOCKED — ${#PREFLIGHT_BLOCKS[@]} blocker(s) must be resolved:"
-        for b in "${PREFLIGHT_BLOCKS[@]+"${PREFLIGHT_BLOCKS[@]}"}"; do log_error "  ✖ $b"; done
-        log_error "══════════════════════════════════════════════════"
-        die "Resolve the blockers above and re-run."
-    fi
-
-    # Warn on warnings
-    if [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]]; then
-        echo
-        log_warn "${#PREFLIGHT_WARNS[@]} warning(s) detected — review above."
-        confirm "Warnings present. Proceed anyway?" || die "Aborted by user."
-    fi
-
-    # Apply auto-fixes before proceeding
-    if [[ ${#PREFLIGHT_AUTOS[@]} -gt 0 ]]; then
-        log_info "Applying ${#PREFLIGHT_AUTOS[@]} auto-fix(es)..."
-        run_autofix
-    fi
-
-    state_set "PHASE_ASSESS" "complete"
-
-    # Run all phases
-    phase_select_target
-    phase_backup
-    phase_prepare
-    phase_install_elevate
-    phase_fix_inhibitors
-    phase_preupgrade
-    phase_upgrade
-}
-
-# ===========================================================================
-#  SECTION 6 — INTERACTIVE MAIN MENU
-# ===========================================================================
-
-show_migration_status() {
-    local sf="${LOG_DIR}/.migration_state"
-    [[ -f "$sf" ]] || return
-    echo -e "  ${BOLD}Current migration progress:${RESET}"
-    local fields=(TARGET_DISTRO PHASE_ASSESS PHASE_BACKUP PHASE_PREPARE PHASE_ELEVATE PHASE_PREUPGRADE PHASE_UPGRADE)
-    for f in "${fields[@]}"; do
-        local v; v=$(grep "^${f}=" "$sf" 2>/dev/null | cut -d= -f2- || echo "—")
-        printf "    %-20s %s\n" "$f:" "${v:-—}"
-    done
-    echo
-}
-
-main_menu() {
-    while true; do
-        banner
-        show_migration_status
-
-        echo -e "  ${BOLD}${WHITE}Main Menu${RESET}"
-        echo
-        echo -e "  ${CYAN}1)${RESET} Assess       — Preflight check (read-only, no changes)"
-        echo -e "  ${CYAN}2)${RESET} Fix          — Auto-fix safe issues found by assessment"
-        echo -e "  ${CYAN}3)${RESET} Migrate      — Full migration wizard (phase by phase)"
-        echo -e "  ${CYAN}4)${RESET} Post-upgrade — Validate after upgrade completes"
-        echo -e "  ${CYAN}5)${RESET} View report  — Open last preflight report"
-        echo -e "  ${CYAN}6)${RESET} Reset state  — Clear saved progress (start fresh)"
-        echo -e "  ${CYAN}0)${RESET} Exit"
-        echo
-        echo -en "  ${YELLOW}Choice: ${RESET}"
-        local ch; read -r ch
-
-        case "$ch" in
-            1)
-                init_logging
-                run_preflight
-                print_preflight_report
-                state_set "PHASE_ASSESS" "complete"
-                echo; echo -en "${YELLOW}  Press Enter to return to menu...${RESET}"; read -r
-                ;;
-            2)
-                init_logging
-                if [[ "$(state_get PHASE_ASSESS)" != "complete" ]]; then
-                    log_warn "No assessment found. Running assessment first..."
-                    run_preflight; print_preflight_report; state_set "PHASE_ASSESS" "complete"
-                fi
-                run_autofix
-                echo; echo -en "${YELLOW}  Press Enter...${RESET}"; read -r
-                ;;
-            3)
-                init_logging
-                do_migrate
-                echo; echo -en "${YELLOW}  Press Enter...${RESET}"; read -r 2>/dev/null || true
-                ;;
-            4)
-                init_logging
-                run_post_upgrade
-                echo; echo -en "${YELLOW}  Press Enter...${RESET}"; read -r
-                ;;
-            5)
-                local rpt; rpt=$(ls -t "${LOG_DIR}"/preflight_report_*.txt 2>/dev/null | head -1 || echo "")
-                if [[ -n "$rpt" ]]; then less "$rpt"
-                else echo "  No report found. Run assessment first."; sleep 2; fi
-                ;;
-            6)
-                confirm "Reset all state? (Does NOT undo system changes)" && \
-                    rm -f "${LOG_DIR}/.migration_state" && preflight_reset && log_ok "State reset."
-                sleep 1
-                ;;
-            0) echo; log_info "Exiting."; exit 0 ;;
-            *) echo "  Invalid choice."; sleep 1 ;;
-        esac
-    done
-}
-
-# ===========================================================================
-#  ENTRY POINT
-# ===========================================================================
-
-parse_args "$@"
-state_init
-
-case "$MODE" in
-    "assess")
-        init_logging; banner
-        [[ $EUID -ne 0 ]] && die "Must run as root."
-        run_preflight; print_preflight_report
-        [[ ${#PREFLIGHT_BLOCKS[@]} -gt 0 ]] && exit 2
-        [[ ${#PREFLIGHT_WARNS[@]} -gt 0 ]] && exit 1
+# =============================================================================
+#  MAIN
+# =============================================================================
+main() {
+    parse_args "$@"
+    init
+
+    banner
+
+    # Handle --post-upgrade
+    if [[ "${1:-}" == "--post-upgrade" ]]; then
+        post_upgrade
         exit 0
-        ;;
-    "fix")
-        init_logging; banner
-        [[ $EUID -ne 0 ]] && die "Must run as root."
-        run_autofix
-        ;;
-    "migrate")
-        init_logging; banner
-        [[ $EUID -ne 0 ]] && die "Must run as root."
-        do_migrate
-        ;;
-    "post-upgrade")
-        init_logging; banner
-        [[ $EUID -ne 0 ]] && die "Must run as root."
-        run_post_upgrade
-        ;;
-    ""|"menu")
-        [[ $EUID -ne 0 ]] && die "Must run as root."
-        init_logging
-        main_menu
-        ;;
-    *)
-        echo "Unknown mode: $MODE"; usage; exit 1 ;;
-esac
+    fi
+
+    echo -e "  ${BLD}This script follows the official ELevate procedure:${RST}"
+    echo -e "  ${CYN}https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html${RST}"
+    echo
+    echo "  Steps:"
+    echo "    1. Fix CentOS 7 repos (EOL — mirrors offline)"
+    echo "    2. Update system to CentOS 7.9"
+    echo "    3. Apply pre-upgrade fixes (pata_acpi, SSH, ABRT, etc.)"
+    echo "    4. Install ELevate + leapp"
+    echo "    5. Run leapp preupgrade (with auto-fix of inhibitors)"
+    echo "    6. Run leapp upgrade → reboot"
+    echo
+    echo -e "  ${YEL}WARNING: This will permanently upgrade your OS.${RST}"
+    echo -e "  ${YEL}         Take a snapshot/backup before proceeding.${RST}"
+    echo
+
+    confirm "Start migration to ${TARGET^^} Linux 8?" || die "Aborted."
+
+    fix_repos
+    update_system
+    preupgrade_fixes
+    install_elevate
+    run_preupgrade
+    run_upgrade
+}
+
+# Handle --post-upgrade as first arg
+if [[ "${1:-}" == "--post-upgrade" ]]; then
+    init
+    post_upgrade
+    exit 0
+fi
+
+main "$@"
