@@ -28,7 +28,7 @@ This script follows the **official AlmaLinux ELevate procedure** exactly, automa
 
 ```bash
 # Download
-curl -O https://raw.githubusercontent.com/your-repo/centos7-el8-migrate/main/centos7_to_el8_migrate.sh
+curl -O https://raw.githubusercontent.com/Suman99pro/centos7-el8-migrate/main/centos7_to_el8_migrate.sh
 chmod +x centos7_to_el8_migrate.sh
 
 # Migrate to AlmaLinux 8 (default)
