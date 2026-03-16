@@ -35,7 +35,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="4.2.0"
+readonly VERSION="4.3.0"
 readonly LOG_DIR="/var/log/el8-migration"
 readonly START_TS="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/migrate_${START_TS}.log"
@@ -1099,11 +1099,16 @@ _auto_fix_inhibitors() {
     [[ -f "$report" ]] || { warn "  No report found."; return 0; }
 
     # ── FIX A: subscription-manager container mode ───────────────────────────
-    # Actor: target_userspace_creator
-    # Root cause: leapp calls subscription-manager INSIDE the nspawn container
-    # The container has its own sub-mgr binary installed as a dnf dependency.
-    # Fix: stub the binary inside the EL8 installroot AND disable the leapp
-    #      actor that triggers this check when LEAPP_NO_RHSM=1.
+    # Root cause: leapp's checkrhsmsku and scansubscriptionmanagerinfo actors
+    # call subscription-manager even when LEAPP_NO_RHSM=1 is set.
+    #
+    # SAFE FIX: directly overwrite the specific RHSM actor files with
+    # no-op versions. We do NOT use regex to patch — that caused syntax errors.
+    # Instead we write the complete actor class from scratch as a valid no-op.
+    #
+    # Affected actors (confirmed from log):
+    #   checkrhsmsku/actor.py
+    #   scansubscriptionmanagerinfo/actor.py
     if grep -q "Cannot set the container mode" "$report"; then
         info "  [A] Fixing: subscription-manager container mode..."
         export LEAPP_NO_RHSM=1
@@ -1121,17 +1126,16 @@ autoAttachInterval = 1440
 disable = 1
 RHSMEOF
 
-        # Host-side: stub binary if absent (older leapp needs it present)
+        # Host-side: stub binary if absent
         if ! command -v subscription-manager &>/dev/null 2>&1; then
             for sm_path in /usr/sbin/subscription-manager /usr/bin/subscription-manager; do
-                printf '#!/bin/sh\n# EL8MIGRATE_STUB - satisfies leapp binary check\nexit 0\n' \
+                printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' \
                     > "$sm_path" 2>/dev/null || true
                 chmod +x "$sm_path" 2>/dev/null || true
             done
         fi
 
         # Installroot-side: stub sub-mgr INSIDE the EL8 container
-        # This is the actual location where the error fires
         local overlay
         overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 \
             -name "system_overlay" -type d 2>/dev/null | head -1 || true)
@@ -1140,12 +1144,8 @@ RHSMEOF
             mkdir -p "${installroot}/etc/rhsm" \
                      "${installroot}/usr/sbin" \
                      "${installroot}/usr/bin" 2>/dev/null || true
-
-            # rhsm.conf inside installroot
             printf '[rhsm]\nmanage_repos = 0\n' \
                 > "${installroot}/etc/rhsm/rhsm.conf" 2>/dev/null || true
-
-            # Stub sub-mgr inside installroot
             for sm in "${installroot}/usr/sbin/subscription-manager" \
                       "${installroot}/usr/bin/subscription-manager"; do
                 printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm" 2>/dev/null || true
@@ -1154,35 +1154,57 @@ RHSMEOF
             ok "  Sub-mgr stubbed in EL8 installroot."
         fi
 
-        # Disable the leapp actor that runs this check
-        # Actor: subscribedrhsm or rhsmfacts — finds it dynamically
-        for actor_base in \
-            /usr/share/leapp-repository/repositories/system_upgrade \
-            /etc/leapp/repos.d/system_upgrade
-        do
-            [[ -d "$actor_base" ]] || continue
-            # Find actor files containing the subscription-manager check
-            while IFS= read -r actor_file; do
-                grep -q "container.*mode\|set_container_mode\|SubscriptionManager" \
-                    "$actor_file" 2>/dev/null || continue
-                grep -q "EL8_DISABLED" "$actor_file" 2>/dev/null && continue
-                [[ -f "${actor_file}.bak" ]] || cp -f "$actor_file" "${actor_file}.bak"
-                # Inject early return when LEAPP_NO_RHSM=1
-                python2 - "$actor_file" << 'PYEOF' 2>/dev/null && \
-                    info "  Disabled actor: $(basename $(dirname $actor_file))/$(basename $actor_file)" || true
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    c = f.read()
-if 'EL8_DISABLED' in c:
-    sys.exit(0)
-guard = '    def process(self):\n        import os\n        if os.environ.get("LEAPP_NO_RHSM","0")=="1":return  # EL8_DISABLED\n'
-c = re.sub(r'(\s+def process\(self\):)', guard, c, count=1)
-with open(path, 'w') as f:
-    f.write(c)
-sys.exit(0)
-PYEOF
-            done < <(find "$actor_base" -name "actor.py" 2>/dev/null)
+        # Directly overwrite RHSM actor files with safe no-op versions.
+        # We write the COMPLETE valid Python class — no regex patching.
+        # Backup originals first so leapp can be reinstalled cleanly if needed.
+        local rhsm_actors=(
+            "checkrhsmsku"
+            "scansubscriptionmanagerinfo"
+            "checksystemregistration"
+            "subscribedrhsm"
+        )
+        for actor_name in "${rhsm_actors[@]}"; do
+            for actor_base in \
+                "/etc/leapp/repos.d/system_upgrade/common/actors/${actor_name}" \
+                "/usr/share/leapp-repository/repositories/system_upgrade/common/actors/${actor_name}"
+            do
+                local actor_file="${actor_base}/actor.py"
+                [[ -f "$actor_file" ]] || continue
+                grep -q "EL8MIGRATE_NOOP" "$actor_file" 2>/dev/null && continue
+
+                # Backup
+                [[ -f "${actor_file}.bak" ]] || \
+                    cp -f "$actor_file" "${actor_file}.bak" 2>/dev/null || true
+
+                # Read the original to extract class name and tags
+                local class_name tags_line
+                class_name=$(grep "^class " "$actor_file" 2>/dev/null | \
+                    head -1 | awk '{print $2}' | cut -d'(' -f1)
+                tags_line=$(grep "^\s*tags\s*=" "$actor_file" 2>/dev/null | head -1 | xargs)
+
+                [[ -z "$class_name" ]] && continue
+
+                # Write a complete valid no-op actor
+                cat > "$actor_file" << ACTOR_EOF
+# EL8MIGRATE_NOOP: RHSM check disabled (non-RHEL system, LEAPP_NO_RHSM=1)
+# Original backed up to ${actor_file}.bak
+import os
+from leapp.actors import Actor
+
+
+class ${class_name}(Actor):
+    """RHSM check — disabled for non-RHEL migration (EL8MIGRATE_NOOP)"""
+    name = '${actor_name}_noop'
+    consumes = ()
+    produces = ()
+    ${tags_line}
+
+    def process(self):
+        # Skipped: LEAPP_NO_RHSM=1 — this system does not use RHSM
+        pass
+ACTOR_EOF
+                ok "  Replaced actor with no-op: $actor_name"
+            done
         done
 
         ok "  subscription-manager fix complete."
