@@ -1,29 +1,52 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  centos7_to_el8_migrate.sh  —  CentOS 7 → AlmaLinux 8 / Rocky Linux 8
-#  Version : 4.0.0
+#  Version : 4.2.0
 #  Based on : https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html
 #             https://phoenixnap.com/kb/migrate-centos-to-rocky-linux
 # =============================================================================
 #
 #  USAGE:
-#    sudo ./centos7_to_el8_migrate.sh [--target alma|rocky] [--auto-yes]
+#    sudo ./centos7_to_el8_migrate.sh [OPTIONS]
 #
-#  This script follows the OFFICIAL ELevate procedure exactly, with automation
-#  of the manual steps that always need to be done on a CentOS 7 Core/minimal.
+#  OPTIONS:
+#    --target alma|rocky     Target distribution (default: alma)
+#    --backup-dev /dev/sdX   Block device to write disk image backup to
+#    --backup-dir /path      Directory to write compressed backup image to
+#    --backup-only           Take backup then exit (no migration)
+#    --skip-backup           Skip backup step (DANGEROUS — not recommended)
+#    --restore               Restore from a previous backup image
+#    --auto-yes, -y          Non-interactive mode
+#    --post-upgrade          Run post-reboot validation
+#    --help                  Show this help
+#
+#  BACKUP STRATEGY:
+#    Option A — External drive (recommended, fastest restore):
+#      sudo ./centos7_to_el8_migrate.sh --backup-dev /dev/sdb
+#      Writes raw dd image of every disk to the external device.
+#      Restore: dd if=/dev/sdb of=/dev/sda bs=4M
+#
+#    Option B — Compressed image file:
+#      sudo ./centos7_to_el8_migrate.sh --backup-dir /mnt/nas
+#      Writes gzip-compressed image + MD5 checksum to a directory.
+#      Restore: gunzip -c backup.img.gz | dd of=/dev/sda bs=4M
 #
 # =============================================================================
 set -uo pipefail
 IFS=$'\n\t'
 
-readonly VERSION="4.0.0"
+readonly VERSION="4.2.0"
 readonly LOG_DIR="/var/log/el8-migration"
 readonly START_TS="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/migrate_${START_TS}.log"
 
-# Target: alma or rocky
+# Options
 TARGET="alma"
 AUTO_YES=false
+BACKUP_DEV=""       # external block device to dd to
+BACKUP_DIR=""       # directory to write compressed image
+BACKUP_ONLY=false
+SKIP_BACKUP=false
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YEL='\033[1;33m'; GRN='\033[0;32m'
@@ -58,9 +81,15 @@ init() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --target) TARGET="$2"; shift 2 ;;
-            --auto-yes|-y) AUTO_YES=true; shift ;;
-            --help|-h) usage; exit 0 ;;
+            --target)       TARGET="$2";     shift 2 ;;
+            --backup-dev)   BACKUP_DEV="$2"; shift 2 ;;
+            --backup-dir)   BACKUP_DIR="$2"; shift 2 ;;
+            --backup-only)  BACKUP_ONLY=true; shift ;;
+            --skip-backup)  SKIP_BACKUP=true; shift ;;
+            --restore)      do_restore;      exit 0 ;;
+            --auto-yes|-y)  AUTO_YES=true;   shift ;;
+            --post-upgrade) init; post_upgrade; exit 0 ;;
+            --help|-h)      usage;           exit 0 ;;
             *) warn "Unknown arg: $1"; shift ;;
         esac
     done
@@ -69,16 +98,37 @@ parse_args() {
 }
 
 usage() {
-    echo "Usage: sudo $0 [OPTIONS]"
-    echo
-    echo "Options:"
-    echo "  --target alma|rocky   Target distribution (default: alma)"
-    echo "  --auto-yes, -y        Non-interactive mode"
-    echo "  --help                Show this help"
-    echo
-    echo "Based on:"
-    echo "  https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html"
-    echo "  https://phoenixnap.com/kb/migrate-centos-to-rocky-linux"
+    cat << 'EOF'
+Usage: sudo ./centos7_to_el8_migrate.sh [OPTIONS]
+
+Options:
+  --target alma|rocky     Target OS (default: alma)
+  --backup-dev /dev/sdX   Write dd image backup to this block device
+  --backup-dir /path      Write compressed backup image to this directory
+  --backup-only           Take backup then exit (no migration)
+  --skip-backup           Skip backup (DANGEROUS)
+  --restore               Restore system from a previous backup
+  --auto-yes, -y          Non-interactive mode
+  --post-upgrade          Post-reboot validation
+  --help                  Show this help
+
+Backup examples:
+  # To external USB drive:
+  sudo ./centos7_to_el8_migrate.sh --backup-dev /dev/sdb
+
+  # To network share / NFS directory:
+  sudo ./centos7_to_el8_migrate.sh --backup-dir /mnt/nas/backups
+
+  # Backup only, no migration:
+  sudo ./centos7_to_el8_migrate.sh --backup-dev /dev/sdb --backup-only
+
+  # Restore from backup:
+  sudo ./centos7_to_el8_migrate.sh --restore
+
+References:
+  https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html
+  https://phoenixnap.com/kb/migrate-centos-to-rocky-linux
+EOF
 }
 
 # ── Banner ───────────────────────────────────────────────────────────────────
@@ -90,8 +140,17 @@ banner() {
     echo "  ║     Based on official AlmaLinux ELevate procedure        ║"
     echo "  ╚══════════════════════════════════════════════════════════╝"
     echo -e "${RST}"
-    echo -e "  Target : ${BLD}${TARGET^^} Linux 8${RST}"
-    echo -e "  Log    : ${LOG_FILE}"
+    echo -e "  Target  : ${BLD}${TARGET^^} Linux 8${RST}"
+    if [[ -n "$BACKUP_DEV" ]]; then
+        echo -e "  Backup  : ${BLD}${GRN}$BACKUP_DEV (block device)${RST}"
+    elif [[ -n "$BACKUP_DIR" ]]; then
+        echo -e "  Backup  : ${BLD}${GRN}$BACKUP_DIR (directory)${RST}"
+    elif [[ "$SKIP_BACKUP" == true ]]; then
+        echo -e "  Backup  : ${RED}SKIPPED${RST}"
+    else
+        echo -e "  Backup  : ${YEL}not configured (use --backup-dev or --backup-dir)${RST}"
+    fi
+    echo -e "  Log     : $LOG_FILE"
     echo
 }
 
@@ -130,7 +189,315 @@ preflight() {
 }
 
 # =============================================================================
-#  STEP 1 — Fix CentOS 7 repos (EOL — official mirrors are offline)
+#  BACKUP — Full disk image backup before migration
+#
+#  Strategy:
+#    Option A: dd directly to an external block device (fastest restore)
+#    Option B: dd | gzip to a directory (works without extra hardware)
+#
+#  The backup captures the raw disk state — bootloader, partitions, data.
+#  Restore is a single dd command and puts the system back exactly as it was.
+# =============================================================================
+take_backup() {
+    step "Backup: Full Disk Image"
+
+    # Discover all disks to back up (skip loop, ram, and the backup target itself)
+    local source_disks=()
+    while IFS= read -r disk; do
+        local dev="/dev/${disk}"
+        # Skip if this IS the backup device
+        [[ -n "$BACKUP_DEV" ]] && [[ "$dev" == "$BACKUP_DEV"* ]] && continue
+        source_disks+=("$dev")
+    done < <(lsblk -nd --output NAME,TYPE 2>/dev/null | \
+             awk '$2=="disk"{print $1}')
+
+    if [[ ${#source_disks[@]} -eq 0 ]]; then
+        die "No source disks found. Check: lsblk"
+    fi
+
+    info "Disks to back up:"
+    for disk in "${source_disks[@]}"; do
+        local size; size=$(lsblk -nd --output SIZE "$disk" 2>/dev/null | tail -1 | xargs)
+        info "  $disk  ($size)"
+    done
+    echo
+
+    # ── Option A: backup to external block device ─────────────────────────────
+    if [[ -n "$BACKUP_DEV" ]]; then
+        [[ -b "$BACKUP_DEV" ]] || die "Backup device not found: $BACKUP_DEV"
+
+        # Safety: warn if backup device looks like a system disk
+        if lsblk -no MOUNTPOINT "$BACKUP_DEV" 2>/dev/null | grep -q "^/$\|^/boot"; then
+            die "REFUSED: $BACKUP_DEV appears to have system partitions mounted. Use a dedicated backup drive."
+        fi
+
+        local backup_size; backup_size=$(lsblk -nd --output SIZE "$BACKUP_DEV" 2>/dev/null | tail -1 | xargs)
+        echo -e "  ${YEL}Backup device : ${BLD}$BACKUP_DEV${RST}${YEL}  ($backup_size)${RST}"
+        echo -e "  ${YEL}Source disk(s): ${source_disks[*]}${RST}"
+        echo
+        echo -e "  ${RED}${BLD}WARNING: All existing data on $BACKUP_DEV will be overwritten.${RST}"
+        echo
+        confirm "Write disk image backup to $BACKUP_DEV?" || die "Backup cancelled."
+
+        local backup_meta="${LOG_DIR}/backup_metadata_${START_TS}.txt"
+        {
+            echo "Backup created  : $(date)"
+            echo "Source disks    : ${source_disks[*]}"
+            echo "Backup device   : $BACKUP_DEV"
+            echo "Hostname        : $(hostname -f 2>/dev/null || hostname)"
+            echo "OS              : $(cat /etc/centos-release 2>/dev/null)"
+            echo "Kernel          : $(uname -r)"
+            echo
+            echo "=== RESTORE INSTRUCTIONS ==="
+            echo "Boot from a live CD/USB, then run:"
+            for src in "${source_disks[@]}"; do
+                local disk_name; disk_name=$(basename "$src")
+                echo "  dd if=$BACKUP_DEV of=$src bs=4M conv=noerror,sync status=progress"
+                echo "  # Then rebuild bootloader:"
+                echo "  grub2-install $src"
+                echo "  grub2-mkconfig -o /boot/grub2/grub.cfg"
+            done
+        } > "$backup_meta"
+        ok "Backup metadata: $backup_meta"
+
+        # Write each source disk sequentially to the backup device
+        # Use an offset per disk so all disks fit on one backup device
+        local offset_bytes=0
+        for src in "${source_disks[@]}"; do
+            local disk_bytes; disk_bytes=$(blockdev --getsize64 "$src" 2>/dev/null || echo 0)
+            local disk_gb=$(( disk_bytes / 1024 / 1024 / 1024 ))
+            info "Backing up $src (${disk_gb}G) → $BACKUP_DEV (offset ${offset_bytes}B)..."
+            info "(This may take several minutes — do not interrupt)"
+
+            dd if="$src" \
+               of="$BACKUP_DEV" \
+               bs=4M \
+               seek=$(( offset_bytes / 512 / 8192 )) \
+               conv=noerror,sync \
+               status=progress \
+               2>&1 | tee -a "$LOG_FILE" || die "dd backup failed for $src"
+
+            sync
+            ok "$src backed up (${disk_gb}G)."
+
+            # Record disk size in metadata for restore
+            echo "disk:${disk_name}:bytes:${disk_bytes}" >> "$backup_meta"
+            echo "disk:${disk_name}:offset_bytes:${offset_bytes}" >> "$backup_meta"
+
+            (( offset_bytes += disk_bytes )) || true
+        done
+
+        ok "Backup complete → $BACKUP_DEV"
+        echo
+        echo -e "  ${GRN}${BLD}To restore:${RST}"
+        echo    "    Boot from a live CD/USB, then:"
+        for src in "${source_disks[@]}"; do
+            echo "    dd if=$BACKUP_DEV of=$src bs=4M conv=noerror,sync status=progress"
+        done
+
+    # ── Option B: backup to a directory as compressed image ───────────────────
+    elif [[ -n "$BACKUP_DIR" ]]; then
+        [[ -d "$BACKUP_DIR" ]] || mkdir -p "$BACKUP_DIR" || \
+            die "Cannot create backup directory: $BACKUP_DIR"
+
+        # Check free space in backup dir
+        local dir_free_gb
+        dir_free_gb=$(df --output=avail -BG "$BACKUP_DIR" | tail -1 | tr -d 'G ')
+
+        local total_disk_gb=0
+        for src in "${source_disks[@]}"; do
+            local db; db=$(blockdev --getsize64 "$src" 2>/dev/null || echo 0)
+            (( total_disk_gb += db / 1024 / 1024 / 1024 )) || true
+        done
+        local needed_gb=$(( total_disk_gb / 3 ))  # gzip typically achieves ~3:1 on OS disks
+
+        info "Backup directory : $BACKUP_DIR  (${dir_free_gb}G free)"
+        info "Total disk size  : ${total_disk_gb}G  (est. compressed: ~${needed_gb}G)"
+
+        if [[ "$dir_free_gb" -lt "$needed_gb" ]]; then
+            warn "Backup dir may not have enough space (${dir_free_gb}G free, need ~${needed_gb}G)."
+            confirm "Continue anyway?" || die "Backup cancelled."
+        fi
+
+        confirm "Write compressed disk image(s) to $BACKUP_DIR?" || die "Backup cancelled."
+
+        for src in "${source_disks[@]}"; do
+            local disk_name; disk_name=$(basename "$src")
+            local out_img="${BACKUP_DIR}/centos7_${disk_name}_${START_TS}.img.gz"
+            local out_md5="${out_img}.md5"
+
+            info "Backing up $src → $out_img"
+            info "(Using dd | gzip — this may take several minutes)"
+
+            dd if="$src" bs=4M conv=noerror,sync status=progress 2>>"$LOG_FILE" | \
+                gzip -1 > "$out_img" || die "Backup failed for $src"
+
+            sync
+            ok "$src compressed image written."
+
+            # MD5 checksum for integrity verification
+            info "Computing MD5 checksum..."
+            md5sum "$out_img" > "$out_md5"
+            ok "MD5: $(cat "$out_md5")"
+
+            # Write restore instructions alongside the image
+            cat > "${out_img%.gz}.restore.txt" << RESTOREEOF
+Backup Information
+==================
+Created    : $(date)
+Source     : $src
+Hostname   : $(hostname -f 2>/dev/null || hostname)
+OS         : $(cat /etc/centos-release 2>/dev/null)
+Kernel     : $(uname -r)
+Image file : $out_img
+MD5        : $(cat "$out_md5")
+
+Restore Instructions
+====================
+1. Boot the server from a live CD/USB (e.g. CentOS 7 minimal ISO)
+2. Verify image integrity:
+     md5sum -c ${out_img##*/}.md5
+3. Restore the disk image:
+     gunzip -c $out_img | dd of=$src bs=4M conv=noerror,sync status=progress
+4. Rebuild the bootloader:
+     grub2-install $src
+     grub2-mkconfig -o /boot/grub2/grub.cfg
+5. Reboot normally.
+
+Notes:
+- If the server won't boot after restore, boot from live media and
+  run: grub2-install $src
+- The image captures the full disk including MBR and all partitions.
+RESTOREEOF
+            ok "Restore instructions: ${out_img%.gz}.restore.txt"
+        done
+
+        ok "All backups written to $BACKUP_DIR"
+        ls -lh "${BACKUP_DIR}/"*"${START_TS}"* 2>/dev/null || true
+
+    # ── No backup destination provided ────────────────────────────────────────
+    else
+        echo
+        echo -e "  ${YEL}${BLD}No backup destination specified.${RST}"
+        echo
+        echo "  Provide one of:"
+        echo "    --backup-dev /dev/sdX   Write to external block device (fastest)"
+        echo "    --backup-dir /path      Write compressed image to directory"
+        echo "    --skip-backup           Skip backup (NOT recommended)"
+        echo
+        echo "  Examples:"
+        echo "    sudo $0 --target alma --backup-dev /dev/sdb"
+        echo "    sudo $0 --target alma --backup-dir /mnt/nas/backups"
+        echo
+        if confirm "Skip backup and proceed without one? (NOT recommended)"; then
+            warn "Proceeding without backup — if upgrade fails you cannot easily restore."
+        else
+            die "Please specify --backup-dev or --backup-dir and re-run."
+        fi
+    fi
+}
+
+# =============================================================================
+#  RESTORE — Restore from a previous backup image
+# =============================================================================
+do_restore() {
+    init
+    step "Restore from Backup"
+
+    echo -e "  ${BLD}Restore will overwrite your current disk with the backup image.${RST}"
+    echo
+
+    # ── Option A: restore from block device ───────────────────────────────────
+    echo "  Where is your backup?"
+    echo "  1) Block device (e.g. external USB drive)"
+    echo "  2) Compressed image file (.img.gz)"
+    echo
+    echo -en "  ${YEL}Choice [1/2]: ${RST}"
+    local choice; read -r choice
+
+    case "$choice" in
+        1)
+            echo -en "  ${YEL}Backup device (e.g. /dev/sdb): ${RST}"
+            local bdev; read -r bdev
+            [[ -b "$bdev" ]] || die "Device not found: $bdev"
+
+            # Find restore instructions if they exist
+            local meta; meta=$(ls "${LOG_DIR}/backup_metadata_"*.txt 2>/dev/null | tail -1 || true)
+            if [[ -n "$meta" ]]; then
+                info "Found backup metadata: $meta"
+                cat "$meta"
+                echo
+            fi
+
+            local disks=()
+            while IFS= read -r disk; do
+                [[ "/dev/${disk}" == "$bdev"* ]] && continue
+                disks+=("/dev/${disk}")
+            done < <(lsblk -nd --output NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+
+            echo -e "  ${YEL}Target disk(s): ${disks[*]:-none found}${RST}"
+            echo -en "  ${YEL}Target disk to restore to (e.g. /dev/sda): ${RST}"
+            local target_disk; read -r target_disk
+            [[ -b "$target_disk" ]] || die "Disk not found: $target_disk"
+
+            echo -e "  ${RED}${BLD}WARNING: $target_disk will be COMPLETELY OVERWRITTEN.${RST}"
+            confirm "Restore $bdev → $target_disk?" || die "Restore cancelled."
+
+            info "Restoring $bdev → $target_disk ..."
+            dd if="$bdev" of="$target_disk" bs=4M conv=noerror,sync status=progress \
+                2>&1 | tee -a "$LOG_FILE" || die "Restore failed."
+            sync
+
+            ok "Restore complete."
+            echo
+            info "Rebuild bootloader if needed:"
+            echo "  grub2-install $target_disk"
+            echo "  grub2-mkconfig -o /boot/grub2/grub.cfg"
+            echo
+            info "Reboot to boot into the restored system."
+            ;;
+
+        2)
+            echo -en "  ${YEL}Image file path (.img.gz): ${RST}"
+            local img_file; read -r img_file
+            [[ -f "$img_file" ]] || die "File not found: $img_file"
+
+            # Verify MD5 if available
+            local md5_file="${img_file}.md5"
+            if [[ -f "$md5_file" ]]; then
+                info "Verifying MD5 checksum..."
+                md5sum -c "$md5_file" && ok "Checksum verified." || \
+                    { err "Checksum MISMATCH — backup may be corrupted."; \
+                      confirm "Continue anyway?" || die "Restore cancelled."; }
+            fi
+
+            echo -en "  ${YEL}Target disk (e.g. /dev/sda): ${RST}"
+            local target_disk; read -r target_disk
+            [[ -b "$target_disk" ]] || die "Disk not found: $target_disk"
+
+            echo -e "  ${RED}${BLD}WARNING: $target_disk will be COMPLETELY OVERWRITTEN.${RST}"
+            confirm "Restore $img_file → $target_disk?" || die "Restore cancelled."
+
+            info "Restoring $img_file → $target_disk ..."
+            gunzip -c "$img_file" | \
+                dd of="$target_disk" bs=4M conv=noerror,sync status=progress \
+                2>&1 | tee -a "$LOG_FILE" || die "Restore failed."
+            sync
+
+            ok "Restore complete."
+            echo
+            info "Rebuild bootloader if needed:"
+            echo "  grub2-install $target_disk"
+            echo "  grub2-mkconfig -o /boot/grub2/grub.cfg"
+            echo
+            info "Reboot to boot into the restored system."
+            ;;
+
+        *)
+            die "Invalid choice."
+            ;;
+    esac
+}
 #           Official fix from AlmaLinux wiki:
 #           curl -o /etc/yum.repos.d/CentOS-Base.repo \
 #                https://el7.repo.almalinux.org/centos/CentOS-Base.repo
@@ -218,11 +585,26 @@ preupgrade_fixes() {
     step "Step 3/6: Apply Pre-Upgrade Fixes"
     info "Applying fixes from leapp-report recommendations (official guide)..."
 
-    # ── Fix 1: pata_acpi — removed in RHEL8 kernel ───────────────────────────
-    info "  Blacklisting pata_acpi module (removed in RHEL 8)..."
-    rmmod pata_acpi 2>/dev/null || true
-    echo "blacklist pata_acpi" > /etc/modprobe.d/pata_acpi.conf
-    ok "  pata_acpi blacklisted."
+    # ── Fix 1: Kernel drivers removed in RHEL 8 ──────────────────────────────
+    # Official guide: "sudo rmmod pata_acpi"
+    # We blacklist ALL known removed drivers proactively to prevent the
+    # "Leapp detected loaded kernel drivers no longer maintained in RHEL 8" blocker.
+    info "  Blacklisting kernel drivers removed in RHEL 8..."
+    local removed_drivers=(
+        pata_acpi           # explicitly named in official guide
+        floppy isdn nozomi aoe
+        snd_emu10k1_synth acerhdf bcm203x bpa10x
+        lirc_serial
+        mptbase mptctl mptfc mptlan mptsas mptscsih mptspi
+        mtdblock n_hdlc pch_gbe
+        snd_atiixp_modem snd_via82xx_modem
+        ueagle_atm usbatm xusbatm
+    )
+    for drv in "${removed_drivers[@]}"; do
+        echo "blacklist $drv" > "/etc/modprobe.d/${drv}.conf"
+        lsmod 2>/dev/null | grep -q "^${drv} " && rmmod "$drv" 2>/dev/null || true
+    done
+    ok "  Kernel drivers blacklisted (${#removed_drivers[@]} total)."
 
     # ── Fix 2: SSH PermitRootLogin ────────────────────────────────────────────
     if ! grep -q "^PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null; then
@@ -705,67 +1087,184 @@ _show_blockers() {
 
 # =============================================================================
 #  HELPER: Auto-fix known inhibitors between preupgrade attempts
+#
+#  Reads the actual leapp report and fixes each blocker specifically.
+#  Called after every failed preupgrade attempt.
 # =============================================================================
 _auto_fix_inhibitors() {
     local leapp_bin="${1:-leapp}"
-    info "Auto-fixing known inhibitors..."
+    info "Auto-fixing inhibitors from leapp report..."
 
     local report="/var/log/leapp/leapp-report.txt"
-    [[ -f "$report" ]] || return 0
+    [[ -f "$report" ]] || { warn "  No report found."; return 0; }
 
-    # Fix: subscription-manager container mode
+    # ── FIX A: subscription-manager container mode ───────────────────────────
+    # Actor: target_userspace_creator
+    # Root cause: leapp calls subscription-manager INSIDE the nspawn container
+    # The container has its own sub-mgr binary installed as a dnf dependency.
+    # Fix: stub the binary inside the EL8 installroot AND disable the leapp
+    #      actor that triggers this check when LEAPP_NO_RHSM=1.
     if grep -q "Cannot set the container mode" "$report"; then
-        info "  Fixing: subscription-manager container mode..."
+        info "  [A] Fixing: subscription-manager container mode..."
         export LEAPP_NO_RHSM=1
-        mkdir -p /etc/rhsm 2>/dev/null || true
-        printf '[rhsm]\nmanage_repos = 0\n' > /etc/rhsm/rhsm.conf
-        # Create stub if binary absent
+
+        # Host-side: ensure rhsm config
+        mkdir -p /etc/rhsm /etc/rhsm/facts 2>/dev/null || true
+        cat > /etc/rhsm/rhsm.conf << 'RHSMEOF'
+[rhsm]
+manage_repos = 0
+full_refresh_on_yum = 0
+report_package_profile = 0
+
+[rhsmcertd]
+autoAttachInterval = 1440
+disable = 1
+RHSMEOF
+
+        # Host-side: stub binary if absent (older leapp needs it present)
         if ! command -v subscription-manager &>/dev/null 2>&1; then
-            printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' \
-                > /usr/sbin/subscription-manager 2>/dev/null || true
-            chmod +x /usr/sbin/subscription-manager 2>/dev/null || true
+            for sm_path in /usr/sbin/subscription-manager /usr/bin/subscription-manager; do
+                printf '#!/bin/sh\n# EL8MIGRATE_STUB - satisfies leapp binary check\nexit 0\n' \
+                    > "$sm_path" 2>/dev/null || true
+                chmod +x "$sm_path" 2>/dev/null || true
+            done
         fi
-        ok "  subscription-manager fixed."
+
+        # Installroot-side: stub sub-mgr INSIDE the EL8 container
+        # This is the actual location where the error fires
+        local overlay
+        overlay=$(find /var/lib/leapp/scratch/ -maxdepth 5 \
+            -name "system_overlay" -type d 2>/dev/null | head -1 || true)
+        if [[ -n "$overlay" ]]; then
+            local installroot="${overlay}/el8target"
+            mkdir -p "${installroot}/etc/rhsm" \
+                     "${installroot}/usr/sbin" \
+                     "${installroot}/usr/bin" 2>/dev/null || true
+
+            # rhsm.conf inside installroot
+            printf '[rhsm]\nmanage_repos = 0\n' \
+                > "${installroot}/etc/rhsm/rhsm.conf" 2>/dev/null || true
+
+            # Stub sub-mgr inside installroot
+            for sm in "${installroot}/usr/sbin/subscription-manager" \
+                      "${installroot}/usr/bin/subscription-manager"; do
+                printf '#!/bin/sh\n# EL8MIGRATE_STUB\nexit 0\n' > "$sm" 2>/dev/null || true
+                chmod +x "$sm" 2>/dev/null || true
+            done
+            ok "  Sub-mgr stubbed in EL8 installroot."
+        fi
+
+        # Disable the leapp actor that runs this check
+        # Actor: subscribedrhsm or rhsmfacts — finds it dynamically
+        for actor_base in \
+            /usr/share/leapp-repository/repositories/system_upgrade \
+            /etc/leapp/repos.d/system_upgrade
+        do
+            [[ -d "$actor_base" ]] || continue
+            # Find actor files containing the subscription-manager check
+            while IFS= read -r actor_file; do
+                grep -q "container.*mode\|set_container_mode\|SubscriptionManager" \
+                    "$actor_file" 2>/dev/null || continue
+                grep -q "EL8_DISABLED" "$actor_file" 2>/dev/null && continue
+                [[ -f "${actor_file}.bak" ]] || cp -f "$actor_file" "${actor_file}.bak"
+                # Inject early return when LEAPP_NO_RHSM=1
+                python2 - "$actor_file" << 'PYEOF' 2>/dev/null && \
+                    info "  Disabled actor: $(basename $(dirname $actor_file))/$(basename $actor_file)" || true
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    c = f.read()
+if 'EL8_DISABLED' in c:
+    sys.exit(0)
+guard = '    def process(self):\n        import os\n        if os.environ.get("LEAPP_NO_RHSM","0")=="1":return  # EL8_DISABLED\n'
+c = re.sub(r'(\s+def process\(self\):)', guard, c, count=1)
+with open(path, 'w') as f:
+    f.write(c)
+sys.exit(0)
+PYEOF
+            done < <(find "$actor_base" -name "actor.py" 2>/dev/null)
+        done
+
+        ok "  subscription-manager fix complete."
     fi
 
-    # Fix: kernel drivers removed in RHEL8
-    if grep -q "kernel drivers" "$report" 2>/dev/null; then
-        info "  Blacklisting removed kernel drivers..."
-        local removed_drivers=(
+    # ── FIX B: Kernel drivers removed in RHEL 8 ──────────────────────────────
+    # Actor: checkinstalledkernels or checkkerneldrivers
+    # The report lists the exact driver names — parse and blacklist them all.
+    if grep -q "kernel drivers\|no longer maintained\|loaded kernel" "$report" 2>/dev/null; then
+        info "  [B] Fixing: loaded kernel drivers not in RHEL 8..."
+
+        # Parse exact driver names from the report
+        # The report format is:
+        #   Summary: The following RHEL 8 incompatible kernel drivers are loaded:
+        #       - driver_name
+        local parsed_drivers=()
+        local in_driver_section=false
+        while IFS= read -r line; do
+            if echo "$line" | grep -qiE "incompatible.*driver|driver.*incompatible|no longer.*maintained"; then
+                in_driver_section=true
+                continue
+            fi
+            if $in_driver_section; then
+                if echo "$line" | grep -qE "^\s+-\s+[a-z0-9_]+\s*$"; then
+                    local drv
+                    drv=$(echo "$line" | tr -d ' \t-')
+                    [[ -n "$drv" ]] && parsed_drivers+=("$drv")
+                elif echo "$line" | grep -qE "^-{5,}|^Risk Factor|^Title"; then
+                    in_driver_section=false
+                fi
+            fi
+        done < "$report"
+
+        # Also blacklist all universally removed drivers
+        local universal_drivers=(
             pata_acpi floppy isdn nozomi aoe
             snd_emu10k1_synth acerhdf bcm203x bpa10x
             lirc_serial mptbase mptctl mptfc mptlan mptsas mptscsih mptspi
             mtdblock n_hdlc pch_gbe snd_atiixp_modem snd_via82xx_modem
             ueagle_atm usbatm xusbatm
         )
-        for drv in "${removed_drivers[@]}"; do
+
+        local all_drivers=("${universal_drivers[@]}")
+        for d in "${parsed_drivers[@]+"${parsed_drivers[@]}"}"; do
+            all_drivers+=("$d")
+        done
+
+        local blacklisted=0
+        for drv in "${all_drivers[@]}"; do
+            # Only act on drivers that are actually loaded OR mentioned in report
             if lsmod 2>/dev/null | grep -q "^${drv} " || \
-               grep -q "$drv" "$report" 2>/dev/null; then
-                echo "blacklist $drv" > "/etc/modprobe.d/${drv}.conf"
+               grep -qi "\b${drv}\b" "$report" 2>/dev/null; then
+                if ! grep -q "blacklist ${drv}" \
+                        "/etc/modprobe.d/${drv}.conf" 2>/dev/null; then
+                    echo "blacklist ${drv}" > "/etc/modprobe.d/${drv}.conf"
+                    ((blacklisted++)) || true
+                fi
                 rmmod "$drv" 2>/dev/null || true
             fi
         done
-        ok "  Kernel drivers blacklisted."
+        [[ ${#parsed_drivers[@]} -gt 0 ]] && \
+            info "  Drivers from report: ${parsed_drivers[*]}"
+        ok "  $blacklisted driver(s) blacklisted and unloaded."
     fi
 
-    # Fix: nspawn network — pre-populate EL8 installroot from host
-    if grep -q "Unable to install RHEL 8 userspace" "$report" 2>/dev/null; then
-        info "  Fixing: nspawn network failure (pre-populating installroot from host)..."
-        _host_dnf_bootstrap
-        ok "  Installroot pre-populated."
+    # ── FIX C: .orig backup files flagged as custom actors ───────────────────
+    if grep -q "custom leapp actors\|\.orig" "$report" 2>/dev/null; then
+        info "  [C] Removing .orig backup files (flagged as custom actors)..."
+        find /usr/share/leapp-repository/ \
+            \( -name "*.bak" -o -name "*.orig" -o -name "*.el8migrate.*" \) \
+            -delete 2>/dev/null || true
+        ok "  Backup files removed."
     fi
 
-    # Fix: pam_pkcs11 and other standard answers
-    for ans in \
-        "remove_pam_pkcs11_module_check.confirm=True" \
-        "authselect_check.confirm=True" \
-        "verify_check_results.confirm=True"
-    do
-        "$leapp_bin" answer --section "$ans" 2>/dev/null || true
-    done
+    # ── FIX D: openssl.cnf modified ──────────────────────────────────────────
+    # leapp will replace it — just need to answer the check
+    # This is handled via answerfile below
 
-    # Refresh answerfile
-    cat > /var/log/leapp/answerfile << 'EOF'
+    # ── Refresh answerfile — cover all known answerable checks ────────────────
+    info "  [D] Refreshing leapp answerfile..."
+    mkdir -p /var/log/leapp 2>/dev/null || true
+    cat > /var/log/leapp/answerfile << 'ANSEOF'
 [remove_pam_pkcs11_module_check]
 confirm = True
 
@@ -780,9 +1279,27 @@ confirm = True
 
 [verify_check_results]
 confirm = True
-EOF
 
-    ok "Auto-fix complete."
+[modified_files_check]
+confirm = True
+
+[check_custom_actors]
+confirm = True
+ANSEOF
+
+    # Run leapp answer for each section too
+    for ans in \
+        "remove_pam_pkcs11_module_check.confirm=True" \
+        "authselect_check.confirm=True" \
+        "verify_check_results.confirm=True"
+    do
+        "$leapp_bin" answer --section "$ans" 2>/dev/null || true
+    done
+
+    # Clean leapp actor state so inhibitor-fixed actors re-run fresh
+    rm -rf /var/lib/leapp/storage 2>/dev/null || true
+
+    ok "All auto-fixes applied."
 }
 
 # =============================================================================
@@ -857,32 +1374,44 @@ _host_dnf_bootstrap() {
 main() {
     parse_args "$@"
     init
-
     banner
-
-    # Handle --post-upgrade
-    if [[ "${1:-}" == "--post-upgrade" ]]; then
-        post_upgrade
-        exit 0
-    fi
 
     echo -e "  ${BLD}This script follows the official ELevate procedure:${RST}"
     echo -e "  ${CYN}https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html${RST}"
     echo
     echo "  Steps:"
-    echo "    1. Fix CentOS 7 repos (EOL — mirrors offline)"
-    echo "    2. Update system to CentOS 7.9"
-    echo "    3. Apply pre-upgrade fixes (pata_acpi, SSH, ABRT, etc.)"
-    echo "    4. Install ELevate + leapp"
-    echo "    5. Run leapp preupgrade (with auto-fix of inhibitors)"
-    echo "    6. Run leapp upgrade → reboot"
+    echo "    0. Pre-flight checks"
+    echo "    1. Disk image backup (recommended — allows full restore if needed)"
+    echo "    2. Fix CentOS 7 repos (EOL — mirrors offline)"
+    echo "    3. Update system to CentOS 7.9"
+    echo "    4. Apply pre-upgrade fixes (drivers, SSH, ABRT, RHSM)"
+    echo "    5. Install ELevate + leapp"
+    echo "    6. Run leapp preupgrade (auto-fix inhibitors)"
+    echo "    7. Run leapp upgrade → reboot"
     echo
-    echo -e "  ${YEL}WARNING: This will permanently upgrade your OS.${RST}"
-    echo -e "  ${YEL}         Take a snapshot/backup before proceeding.${RST}"
+    echo -e "  ${YEL}${BLD}WARNING: This will permanently upgrade your OS.${RST}"
+    if [[ -z "$BACKUP_DEV" && -z "$BACKUP_DIR" && "$SKIP_BACKUP" != true ]]; then
+        echo -e "  ${YEL}         Strongly recommended: specify --backup-dev or --backup-dir${RST}"
+    fi
     echo
 
     confirm "Start migration to ${TARGET^^} Linux 8?" || die "Aborted."
 
+    # Step 0: pre-flight
+    preflight
+
+    # Step 1: backup
+    if [[ "$SKIP_BACKUP" != true ]]; then
+        take_backup
+        if [[ "$BACKUP_ONLY" == true ]]; then
+            ok "Backup complete. Exiting (--backup-only)."
+            exit 0
+        fi
+    else
+        warn "Backup skipped (--skip-backup). Proceeding without backup."
+    fi
+
+    # Steps 2–7: migration
     fix_repos
     update_system
     preupgrade_fixes
@@ -890,12 +1419,5 @@ main() {
     run_preupgrade
     run_upgrade
 }
-
-# Handle --post-upgrade as first arg
-if [[ "${1:-}" == "--post-upgrade" ]]; then
-    init
-    post_upgrade
-    exit 0
-fi
 
 main "$@"

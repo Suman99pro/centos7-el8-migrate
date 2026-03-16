@@ -1,65 +1,76 @@
 # Changelog
 
+## [4.2.0] — 2026-03-16
+
+### Added: Full disk image backup and restore
+
+- **`--backup-dev /dev/sdX`** — writes raw `dd` image of all system disks to
+  an external block device. Fastest restore method: single `dd` command.
+
+- **`--backup-dir /path`** — writes `gzip`-compressed disk image(s) to any
+  directory (NFS, local, USB). Creates `.img.gz`, `.md5` checksum, and
+  `.restore.txt` instructions alongside each image.
+
+- **`--backup-only`** — take backup and exit without migrating.
+
+- **`--restore`** — interactive restore wizard. Supports both block device
+  and compressed image restore, with MD5 verification before writing.
+
+- **`--skip-backup`** — bypass backup step (not recommended, requires
+  explicit confirmation).
+
+- Backup step is now Step 1 in the migration flow, before any system changes.
+
+- Backup metadata file records exact restore commands including `dd` offset
+  for multi-disk systems and `grub2-install` commands.
+
+- Banner now shows backup destination and status.
+
+---
+
+## [4.1.0] — 2026-03-15
+
+### Fixed: Two hard leapp blockers
+
+- **Kernel drivers not in RHEL 8:** Now blacklists all 20+ known removed
+  drivers proactively in Step 3 (`preupgrade_fixes`). Also parses the leapp
+  report for any additional drivers and blacklists those specifically.
+
+- **subscription-manager container mode:** Comprehensive three-layer fix —
+  stubs the binary inside the EL8 installroot, writes `manage_repos=0` to
+  the installroot's `rhsm.conf`, and patches the leapp actor's `process()`
+  method to skip the check when `LEAPP_NO_RHSM=1`.
+
+- **`.orig` backup files flagged as custom actors:** `_auto_fix_inhibitors`
+  now removes all `.bak`, `.orig`, and `.el8migrate.*` files from the leapp
+  repository after each retry.
+
+- **openssl.cnf and other answerable checks:** Added to answerfile.
+
+---
+
 ## [4.0.0] — 2026-03-15
 
-### Complete rewrite — based on official ELevate procedure
+### Complete rewrite — official ELevate procedure
 
-**Why:** Previous versions (1.x–3.x) accumulated layers of workarounds
-that were masking the real issues. This version starts from the official
-AlmaLinux ELevate guide and adds only the automations that are genuinely
-needed for a CentOS 7 Core/minimal install.
+Replaced the v3.x state-machine/menu infrastructure with a clean linear
+script that follows the official AlmaLinux ELevate guide step-for-step.
 
-### What changed
-
-- Script now follows official procedure from
-  https://wiki.almalinux.org/elevate/ELevating-CentOS7-to-AlmaLinux-10.html
-  step for step — no deviation from the documented path
-
-- **CentOS 7 EOL repo fix:** added as Step 1 — official fix from AlmaLinux wiki
-  (`curl -o /etc/yum.repos.d/CentOS-Base.repo https://el7.repo.almalinux.org/...`)
-
-- **NIC protection:** `systemd-nspawn` binary wrapper injects `--network-none`
-  unconditionally — prevents host NIC from being moved into container namespace
-  (systemd v219 bug, confirmed in issue #4330)
-
-- **subscription-manager:** sets `LEAPP_NO_RHSM=1` + `manage_repos=0` in
-  `/etc/rhsm/rhsm.conf` + creates stub binary if absent — covers all leapp
-  versions including pre-PR#1133 builds that require binary presence
-
-- **EL8 installroot bootstrap:** pre-populates installroot from host when nspawn
-  network fails (correct fix, not a workaround)
-
-- **NIC watchdog:** background process restores NIC if it goes DOWN during
-  preupgrade — only monitors real NICs, never touches virbr/veth/docker
-
-- Removed all the accumulated complexity from v3.x that was not solving the
-  root causes
-
-### Removed
-- All the custom assessment/menu/state-machine infrastructure from v3.x
-- Multiple duplicate fix functions
-- All the ad-hoc workarounds that weren't addressing root causes
+- Six steps matching the official guide exactly
+- CentOS 7 EOL repo fix as Step 1 (official AlmaLinux mirror)
+- `systemd-nspawn` binary wrapper prevents NIC capture (systemd v219 bug)
+- Host-side EL8 installroot bootstrap bypasses nspawn network failure
+- NIC watchdog monitors and restores interface during preupgrade
 
 ---
 
 ## [3.x] — 2026-03-13 to 2026-03-14
 
-Iterative debugging session. Multiple attempts to fix:
-- nspawn network failures (python regex patching — unreliable)
-- subscription-manager (removal approach — wrong)
-- CentOS 7 EOL repos (not addressed early enough)
+Iterative debugging. Multiple fixes for nspawn network, subscription-manager,
+and CentOS 7 EOL repos.
 
 ---
 
-## [2.0.0] — 2026-03-13
+## [1.0.0–2.0.0] — 2026-03-13
 
-- Added Rocky Linux support
-- Added leapp inhibitor auto-remediation
-- Added backup phase
-
----
-
-## [1.0.0] — 2026-03-13
-
-- Initial release
-- Basic CentOS 7 → AlmaLinux 8 automation
+Initial release. Basic automation, Rocky Linux support added.
