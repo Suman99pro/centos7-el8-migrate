@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Script Name: centos7-el8-migrate.sh
-# Author: [Your Name/GitHub Handle]
+# Author: [Suman Kafle/Suman99pro]
 # Description: Automates CentOS 7 to AlmaLinux 8 or Rocky Linux 8 migration.
 # ==============================================================================
 
