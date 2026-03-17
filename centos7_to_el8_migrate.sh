@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# Script Name: centos7-el8-migrate.sh (Universal & Self-Healing)
-# Version: 2.0
+# Script Name: centos7-el8-migrate.sh
+# Version: 2.1 (Universal Archive Edition)
 # Description: CentOS 7 -> EL8 Migration + Post-Upgrade Cleanup
 # ==============================================================================
 
@@ -36,27 +36,24 @@ if [[ "$OS_VER" == "8" ]]; then
     read -p "Do you want to perform post-upgrade cleanup (remove el7 pkgs, set Python)? (y/n): " do_cleanup
     if [[ $do_cleanup == "y" ]]; then
         log "Setting Python 3 as default..."
-        alternatives --set python /usr/bin/python3 || warn "Could not set python3 alternatives automatically."
+        alternatives --set python /usr/bin/python3 || warn "Could not set python3 alternatives."
         
-        log "Removing leftover EL7 packages (this may take a moment)..."
-        # We use a cautious approach to remove packages that are strictly EL7
+        log "Removing leftover EL7 packages..."
         EL7_PKGS=$(rpm -qa | grep el7 | grep -v "gpg-pubkey" || true)
         if [ -n "$EL7_PKGS" ]; then
-            yum remove -y $EL7_PKGS || warn "Some EL7 packages could not be removed automatically."
+            yum remove -y $EL7_PKGS || warn "Some EL7 packages remained."
         fi
         
-        log "Cleaning up Yum/DNF metadata..."
-        dnf clean all
-        rm -rf /var/cache/dnf
-        
-        log "SUCCESS: System is now cleaned and optimized for EL8."
+        log "Cleaning up DNF metadata..."
+        dnf clean all && rm -rf /var/cache/dnf
+        log "SUCCESS: Cleanup complete."
     fi
     exit 0
 fi
 
 # --- MIGRATION LOGIC (For CentOS 7) ---
 echo "--------------------------------------------------------"
-echo " CentOS 7 to EL8 Migration Tool (Universal)            "
+echo " CentOS 7 to EL8 Migration Tool (Universal Archive)    "
 echo "--------------------------------------------------------"
 
 # 1. Kernel and Root Disk Detection
@@ -66,7 +63,7 @@ LATEST_KERN=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | so
 
 if [[ "$CURRENT_KERN" != "$LATEST_KERN" ]]; then
     warn "Kernel mismatch! Running: $CURRENT_KERN | Latest: $LATEST_KERN"
-    read -p "A reboot is required to load the new kernel. Reboot now? (y/n): " kern_reboot
+    read -p "Reboot required to load new kernel. Reboot now? (y/n): " kern_reboot
     [[ $kern_reboot == "y" ]] && reboot || error_exit "Please reboot and run script again."
 fi
 
@@ -78,37 +75,39 @@ if [[ $do_backup == "y" ]]; then
     dd if="/dev/$DETECTED_ROOT_DISK" conv=sync,noerror bs=64K status=progress | gzip -c > "$BACKUP_PATH" || warn "Backup incomplete."
 fi
 
-# 3. Fixing EOL Repos
-log "Updating CentOS 7 Repos to Vault (Fixing 404s)..."
+# 3. Fixing EOL Repos using Archive.kernel.org (Working Version)
+log "Updating CentOS 7 Repos to Kernel Archive..."
 mkdir -p /etc/yum.repos.d/old_repos
 mv /etc/yum.repos.d/CentOS-* /etc/yum.repos.d/old_repos/ || true
 
-cat <<EOF > /etc/yum.repos.d/CentOS-Vault.repo
+cat <<EOF > /etc/yum.repos.d/CentOS-Archive.repo
 [base]
-name=CentOS-7-Base-Vault
-baseurl=http://vault.centos.org/7.9.2009/os/\$basearch/
-gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+name=CentOS-7 - Base
+baseurl=http://archive.kernel.org/centos-vault/7.9.2009/os/\$basearch/
+enabled=1
+gpgcheck=0
+
 [updates]
-name=CentOS-7-Updates-Vault
-baseurl=http://vault.centos.org/7.9.2009/updates/\$basearch/
-gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+name=CentOS-7 - Updates
+baseurl=http://archive.kernel.org/centos-vault/7.9.2009/updates/\$basearch/
+enabled=1
+gpgcheck=0
+
 [extras]
-name=CentOS-7-Extras-Vault
-baseurl=http://vault.centos.org/7.9.2009/extras/\$basearch/
-gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+name=CentOS-7 - Extras
+baseurl=http://archive.kernel.org/centos-vault/7.9.2009/extras/\$basearch/
+enabled=1
+gpgcheck=0
 EOF
 
-yum clean all && yum update -y
+yum clean all && yum makecache && yum update -y
 
 # 4. Tool Installation
 log "Installing ELevate for $TARGET_OS..."
 yum install -y http://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm
 [[ "$TARGET_OS" == "almalinux" ]] && yum install -y leapp-upgrade leapp-data-almalinux || yum install -y leapp-upgrade leapp-data-rocky
 
-# 5. Resolving Inhibitors (The 'Universal' way)
+# 5. Resolving Inhibitors
 log "Silencing inhibitors..."
 modprobe -r pata_acpi || true
 leapp answer --section remove_pam_pkcs11_module_check.confirm=True || true
@@ -122,11 +121,10 @@ PRE_STATUS=$?
 set -e
 
 if [ $PRE_STATUS -eq 0 ]; then
-    log "Passed. Starting OS Upgrade..."
+    log "Passed! Starting OS Upgrade..."
     leapp upgrade
-    log "Rebooting in 10s to begin the conversion process."
-    sleep 10
-    reboot
+    log "Rebooting in 10s to finalize."
+    sleep 10 && reboot
 else
     error_exit "Migration inhibited. Check /var/log/leapp/leapp-report.txt"
 fi
