@@ -15,7 +15,7 @@ This script is designed to be run twice:
 Clone the repository and execute the script on your CentOS 7 machine:
 
 ```bash
-git clone [https://github.com/yourusername/centos7-el8-migrate.git](https://github.com/yourusername/centos7-el8-migrate.git)
+git clone https://github.com/Suman99pro/centos7-el8-migrate.git
 cd centos7-el8-migrate
 chmod +x centos7-el8-migrate.sh
 sudo ./centos7-el8-migrate.sh
