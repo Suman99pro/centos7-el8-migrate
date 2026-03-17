@@ -1,23 +1,21 @@
-# CentOS 7 to EL8 Migration Script
+# Universal CentOS 7 to EL8 Migrator
 
-A fully functional bash script to migrate **CentOS 7** to **AlmaLinux 8** or **Rocky Linux 8** using the ELevate framework. 
+A "one-and-done" script to migrate from CentOS 7 to **AlmaLinux 8** or **Rocky Linux 8**. This script handles the complex migration logic and the necessary post-upgrade cleanup in a single file.
 
-## ⚙️ Configuration
-Before execution, edit the following variables at the top of `centos7-el8-migrate.sh`:
+## 🌟 How it Works
+This script is designed to be run twice:
+1.  **Phase 1 (CentOS 7):** Acts as a migration orchestrator. It repairs EOL repositories, resolves system inhibitors, and initiates the ELevate/Leapp process.
+2.  **Phase 2 (EL8):** Acts as a cleanup utility. After the reboot, running the same script will detect the new OS and offer to optimize the system.
 
-| Variable | Description |
-| :--- | :--- |
-| `DISK_TO_BACKUP` | The physical disk device you want to image (e.g., `/dev/sda`). |
-| `BACKUP_DIR` | The destination directory for your backup. **Crucial:** This should be a mount point for an external drive or network share to avoid filling up the OS disk. |
-| `TARGET_OS` | Set to either `almalinux` or `rockylinux`. |
+---
 
-## ⚠️ Warning
-This script performs an in-place OS upgrade. While it includes a `dd` backup option, always ensure you have off-site backups of your critical data. 
+## 🚀 Usage Instructions
 
-## Usage
+### 1. Preparation & Migration
+Clone the repository and execute the script on your CentOS 7 machine:
 
-1. **Clone & Prep:**
-   ```bash
-   git clone [https://github.com/yourusername/your-repo-name.git](https://github.com/yourusername/your-repo-name.git)
-   cd your-repo-name
-   chmod +x centos7-el8-migrate.sh
+```bash
+git clone [https://github.com/yourusername/centos7-el8-migrate.git](https://github.com/yourusername/centos7-el8-migrate.git)
+cd centos7-el8-migrate
+chmod +x centos7-el8-migrate.sh
+sudo ./centos7-el8-migrate.sh

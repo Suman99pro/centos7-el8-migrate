@@ -1,93 +1,132 @@
 #!/bin/bash
 
 # ==============================================================================
-# Script Name: centos7-el8-migrate.sh
-# Author: [Suman Kafle/Suman99pro]
-# Description: Automates CentOS 7 to AlmaLinux 8 or Rocky Linux 8 migration.
+# Script Name: centos7-el8-migrate.sh (Universal & Self-Healing)
+# Version: 2.0
+# Description: CentOS 7 -> EL8 Migration + Post-Upgrade Cleanup
 # ==============================================================================
 
 set -e
 
 # --- Configuration ---
 LOG_FILE="/var/log/migration_$(date +%F).log"
-BACKUP_DIR="/mnt/backup_migration" # MUST be a separate physical drive/mount
-DISK_TO_BACKUP="/dev/sda"          # Change to your root disk (e.g., /dev/nvme0n1)
-TARGET_OS="almalinux"              # Options: almalinux, rockylinux
+TARGET_OS="almalinux" # Options: almalinux, rockylinux
 
 # UI Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' 
 
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}" | tee -a "$LOG_FILE"
-}
+log() { echo -e "${GREEN}[$(date +'%F %T')] $1${NC}" | tee -a "$LOG_FILE"; }
+warn() { echo -e "${YELLOW}[WARN] $1${NC}" | tee -a "$LOG_FILE"; }
+error_exit() { echo -e "${RED}[ERROR] $1${NC}" | tee -a "$LOG_FILE"; exit 1; }
 
-error_exit() {
-    echo -e "${RED}[ERROR] $1${NC}" | tee -a "$LOG_FILE"
-    exit 1
-}
+if [[ $EUID -ne 0 ]]; then error_exit "This script must be run as root."; fi
 
-if [[ $EUID -ne 0 ]]; then
-   error_exit "This script must be run as root."
-fi
+# --- DETECTION LOGIC: Are we on EL7 or EL8? ---
+OS_VER=$(rpm -E %{rhel})
 
-echo "--------------------------------------------------------"
-echo " CentOS 7 to EL8 Migration Tool (ELevate)              "
-echo "--------------------------------------------------------"
-
-# 1. Backup Logic
-read -p "Do you want to create a full disk image backup before proceeding? (y/n): " do_backup
-if [[ $do_backup == "y" ]]; then
-    if ! mountpoint -q "$BACKUP_DIR"; then
-        log "Warning: $BACKUP_DIR does not appear to be a separate mount point."
-        read -p "Are you sure you want to save the backup here? (y/n): " confirm_mount
-        [[ $confirm_mount != "y" ]] && error_exit "Aborted to prevent disk space exhaustion."
+if [[ "$OS_VER" == "8" ]]; then
+    echo -e "${BLUE}========================================================${NC}"
+    echo -e "${GREEN}  DETECTED ALMALINUX / ROCKY 8 - POST-UPGRADE MODE     ${NC}"
+    echo -e "${BLUE}========================================================${NC}"
+    
+    read -p "Do you want to perform post-upgrade cleanup (remove el7 pkgs, set Python)? (y/n): " do_cleanup
+    if [[ $do_cleanup == "y" ]]; then
+        log "Setting Python 3 as default..."
+        alternatives --set python /usr/bin/python3 || warn "Could not set python3 alternatives automatically."
+        
+        log "Removing leftover EL7 packages (this may take a moment)..."
+        # We use a cautious approach to remove packages that are strictly EL7
+        EL7_PKGS=$(rpm -qa | grep el7 | grep -v "gpg-pubkey" || true)
+        if [ -n "$EL7_PKGS" ]; then
+            yum remove -y $EL7_PKGS || warn "Some EL7 packages could not be removed automatically."
+        fi
+        
+        log "Cleaning up Yum/DNF metadata..."
+        dnf clean all
+        rm -rf /var/cache/dnf
+        
+        log "SUCCESS: System is now cleaned and optimized for EL8."
     fi
-
-    mkdir -p "$BACKUP_DIR"
-    log "Starting full disk backup of $DISK_TO_BACKUP to $BACKUP_DIR..."
-    dd if="$DISK_TO_BACKUP" conv=sync,noerror bs=64K status=progress | gzip -c > "$BACKUP_DIR/centos7_backup_$(date +%F).img.gz" || error_exit "Backup failed!"
-    log "Backup completed: $BACKUP_DIR/centos7_backup_$(date +%F).img.gz"
+    exit 0
 fi
 
-# 2. Preparation & EOL Repo Fix
-log "Updating CentOS 7 and fixing EOL repositories..."
-sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
-sed -i 's|#baseurl=http://mirror.centos.org|baseurl=https://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
+# --- MIGRATION LOGIC (For CentOS 7) ---
+echo "--------------------------------------------------------"
+echo " CentOS 7 to EL8 Migration Tool (Universal)            "
+echo "--------------------------------------------------------"
 
-yum update -y || error_exit "Initial system update failed."
+# 1. Kernel and Root Disk Detection
+DETECTED_ROOT_DISK=$(lsblk -no pkname $(findmnt -nvo SOURCE /))
+CURRENT_KERN=$(uname -r)
+LATEST_KERN=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1)
 
-# 3. Install Migration Tools
-log "Installing ELevate and Leapp for $TARGET_OS..."
+if [[ "$CURRENT_KERN" != "$LATEST_KERN" ]]; then
+    warn "Kernel mismatch! Running: $CURRENT_KERN | Latest: $LATEST_KERN"
+    read -p "A reboot is required to load the new kernel. Reboot now? (y/n): " kern_reboot
+    [[ $kern_reboot == "y" ]] && reboot || error_exit "Please reboot and run script again."
+fi
+
+# 2. Universal Backup
+read -p "Create full disk image backup of /dev/$DETECTED_ROOT_DISK? (y/n): " do_backup
+if [[ $do_backup == "y" ]]; then
+    read -p "Enter full path for backup (e.g. /mnt/external/backup.img.gz): " BACKUP_PATH
+    log "Imaging /dev/$DETECTED_ROOT_DISK to $BACKUP_PATH..."
+    dd if="/dev/$DETECTED_ROOT_DISK" conv=sync,noerror bs=64K status=progress | gzip -c > "$BACKUP_PATH" || warn "Backup incomplete."
+fi
+
+# 3. Fixing EOL Repos
+log "Updating CentOS 7 Repos to Vault (Fixing 404s)..."
+mkdir -p /etc/yum.repos.d/old_repos
+mv /etc/yum.repos.d/CentOS-* /etc/yum.repos.d/old_repos/ || true
+
+cat <<EOF > /etc/yum.repos.d/CentOS-Vault.repo
+[base]
+name=CentOS-7-Base-Vault
+baseurl=http://vault.centos.org/7.9.2009/os/\$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+[updates]
+name=CentOS-7-Updates-Vault
+baseurl=http://vault.centos.org/7.9.2009/updates/\$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+[extras]
+name=CentOS-7-Extras-Vault
+baseurl=http://vault.centos.org/7.9.2009/extras/\$basearch/
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+EOF
+
+yum clean all && yum update -y
+
+# 4. Tool Installation
+log "Installing ELevate for $TARGET_OS..."
 yum install -y http://repo.almalinux.org/elevate/elevate-release-latest-el7.noarch.rpm
+[[ "$TARGET_OS" == "almalinux" ]] && yum install -y leapp-upgrade leapp-data-almalinux || yum install -y leapp-upgrade leapp-data-rocky
 
-if [[ "$TARGET_OS" == "almalinux" ]]; then
-    yum install -y leapp-upgrade leapp-data-almalinux
-else
-    yum install -y leapp-upgrade leapp-data-rocky
-fi
+# 5. Resolving Inhibitors (The 'Universal' way)
+log "Silencing inhibitors..."
+modprobe -r pata_acpi || true
+leapp answer --section remove_pam_pkcs11_module_check.confirm=True || true
+grep -q "PermitRootLogin yes" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 
-# 4. Pre-upgrade
-log "Running Leapp pre-upgrade check..."
-set +e 
+# 6. Execution
+log "Running Pre-upgrade check..."
+set +e
 leapp preupgrade
+PRE_STATUS=$?
 set -e
 
-log "Applying automated fixes for known inhibitors..."
-rmmod pata_acpi || true
-echo PermitRootLogin yes >> /etc/ssh/sshd_config
-leapp answer --section remove_pam_pkcs11_module_check.confirm=True
-
-# 5. Final Execution
-echo -e "${RED}Final check: Review /var/log/leapp/leapp-report.txt before proceeding.${NC}"
-read -p "Proceed with the actual OS upgrade? (y/n): " run_upgrade
-if [[ $run_upgrade == "y" ]]; then
-    log "Starting Leapp upgrade. This will take time."
-    leapp upgrade || error_exit "Leapp upgrade process failed."
-    log "Upgrade staged. Rebooting to finish the process..."
-    sleep 5
+if [ $PRE_STATUS -eq 0 ]; then
+    log "Passed. Starting OS Upgrade..."
+    leapp upgrade
+    log "Rebooting in 10s to begin the conversion process."
+    sleep 10
     reboot
 else
-    log "Upgrade halted by user."
+    error_exit "Migration inhibited. Check /var/log/leapp/leapp-report.txt"
 fi
