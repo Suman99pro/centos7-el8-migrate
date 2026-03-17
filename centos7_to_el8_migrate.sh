@@ -1,46 +1,59 @@
 #!/bin/bash
+# centos7_to_el8_migrate.sh
 
-# Function for post-upgrade checks
-post_upgrade() {
-    echo "Running post-upgrade checks..."
-    # Add your validation logic here
-}
-
-# Confirm function with improved error handling
+# Function to confirm user's action with a yes/no prompt
 confirm() {
-    while true; do
-        read -p "Are you sure? (yes/no) " yn
-        case $yn in
-            [Yy]* ) return 0;;
-            [Nn]* ) return 1;;
-            * ) echo "Please answer yes or no.";;
-        esac
-    done
+    read -r -p "$1 [y/n]: " response
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            return 0
+            ;;
+        [nN][oO]|[nN]
+            return 1
+            ;;
+        *)
+            echo "Invalid response. Please answer 'y' or 'n'."
+            confirm "$1"
+            ;;
+    esac
 }
 
-# Main function with --post-upgrade support
-main() {
-    # Existing code...
+# Post upgrade function
+post_upgrade() {
+    echo "Performing post-upgrade tasks..."
+    # Add your post-upgrade commands here
+}
 
-    # Change made on line 74
-    yum makecache
+# Command-line argument parsing
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --post-upgrade)
+            POST_UPGRADE=true
+            shift
+            ;;  
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
 
-    # Reboot and call post_upgrade() if --post-upgrade is passed
-    if [[ $1 == "--post-upgrade" ]]; then
-        reboot
+# Main script workflow
+echo "Starting migration from CentOS 7 to EL8..."
+
+# Fix deprecated command, using yum makecache instead
+yum makecache
+
+# Confirm before proceeding with the migration
+if confirm "Are you sure you want to continue with the migration?"; then
+    echo "Migration in progress..."
+    # Add migration commands here
+    if [ "\$POST_UPGRADE" == true ]; then
         post_upgrade
     fi
-
-    # Optionally, create a systemd service for post-upgrade checks
-    echo -e "[Unit]\nDescription=Post-Upgrade Validation\nAfter=reboot.target\n\n[Service]\nType=oneshot\nExecStart=/path/to/validation-script.sh\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target" > /etc/systemd/system/post-upgrade-validation.service
-    systemctl enable post-upgrade-validation.service
-
-    # Rest of the existing code...
-}
-
-# Argument parsing
-if [[ $# -gt 0 ]]; then
-    main "$@"
+    echo "Migration completed successfully."
 else
-    main
+    echo "Migration canceled."
 fi
+
+exit 0
