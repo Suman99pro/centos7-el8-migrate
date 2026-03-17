@@ -20,6 +20,6 @@ This script performs an in-place OS upgrade. While it includes a backup option, 
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/Suman99pro/centos7-el8-migrate.git](https://github.com/Suman99pro/centos7-el8-migrate.git)
+   git clone https://github.com/Suman99pro/centos7-el8-migrate.git
    cd centos7-el8-migrate
    chmod +x centos7-el8-migrate.sh
